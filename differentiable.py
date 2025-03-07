@@ -4,20 +4,51 @@ import jax.numpy as jnp
 # This isn't actually large. But large in the context of tree diff errors (at least I hope so...)
 VERY_LARGE_NUMBER = 10**3
 
+# Calculate accuracy percentage
+def accuracy_metric(actual, predicted):
+    correct = 0
+    for i in range(len(actual)):
+        if actual[i] == predicted[i]:
+            correct += 1
+    return correct / float(len(actual)) * 100.0
+
+def test_tree(tree, data):
+    predictions = [tree.predict(sample) for sample in data]
+    return accuracy_metric(data[:, -1], predictions)
+
+
 class DiffableTree:
-    
     def __init__(self, max_depth, min_size):
         self.max_depth = max_depth
         self.min_size = min_size
     
     
+    # Wrapper for non-instance __predict() function
+    def predict(self, row):
+        return self.__predict(self.root, row)
+
+    
+    # Make a prediction with a decision tree
+    def __predict(self, node, row):
+        if row[node['index']] < node['value']:
+            if isinstance(node['left'], dict):
+                return self.__predict(node['left'], row)
+            else:
+                return node['left']
+        else:
+            if isinstance(node['right'], dict):
+                return self.__predict(node['right'], row)
+            else:
+                return node['right']
+
+    # Fit tree to 'train' data, which contains labels at last row
     def fit(self, train):
         assert type(train) == list
         
         self.root = self.get_split(train)
-        self.split(self.root, self.max_depth, self.min_size, 1)
+        self.split(self.root, 1)
 
-    
+
     def get_split(self, dataset):
         class_values = list(jnp.unique(jnp.array(list(row[-1] for row in dataset))))
         b_index, b_value, b_score, b_groups = 999, 999, 999, None
@@ -28,7 +59,7 @@ class DiffableTree:
                 if gini < b_score:
                     b_index, b_value, b_score, b_groups = index, row[index], gini, groups
         return {'index':b_index, 'value':b_value, 'groups':b_groups}
-    
+
 
     # Split a dataset based on an attribute and an attribute value
     def test_split(self, index, value, dataset):
@@ -41,7 +72,7 @@ class DiffableTree:
         return left, right
     
     
-    def split(self, node, max_depth, min_size, depth):
+    def split(self, node, depth):
         left, right = node['groups']
         del(node['groups'])
         # check for a no split
@@ -49,21 +80,21 @@ class DiffableTree:
             node['left'] = node['right'] = self.to_terminal(left + right)
             return
         # check for max depth
-        if depth >= max_depth:
+        if depth >= self.max_depth:
             node['left'], node['right'] = self.to_terminal(left), self.to_terminal(right)
             return
         # process left child
-        if len(left) <= min_size:
+        if len(left) <= self.min_size:
             node['left'] = self.to_terminal(left)
         else:
             node['left'] = self.get_split(left)
-            self.split(node['left'], max_depth, min_size, depth+1)
+            self.split(node['left'], depth+1)
         # process right child
-        if len(right) <= min_size:
+        if len(right) <= self.min_size:
             node['right'] = self.to_terminal(right)
         else:
             node['right'] = self.get_split(right)
-            self.split(node['right'], max_depth, min_size, depth+1)
+            self.split(node['right'], depth+1)
 
 
     # Create a terminal node value
