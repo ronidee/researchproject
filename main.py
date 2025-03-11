@@ -15,6 +15,7 @@ from csv import reader
 from pathlib import Path
 
 from differentiable import DiffableTree, tree_diff, test_tree
+import utils
 
 
 
@@ -92,10 +93,6 @@ def init_client():
     client_train, client_test = train_test_split(dataset, train_size=args.n_train, test_size=args.n_test, random_state=args.rand_state)
     client_tree = DiffableTree(max_depth=args.max_depth, min_size=args.min_size)
     client_tree.fit(client_train.tolist())
-    # Ask to save new client state    
-    # user_input = input("Created new client dataset and tree upate. Save?[y/N]")
-    # if user_input.lower() == 'y':
-    #     pass
     
     acc = test_tree(client_tree, client_test)
     print(f"Built new client_tree with accuracy: {acc}")
@@ -106,19 +103,32 @@ def init_dummy(client_train, target_index):
     dummy_train = randomize_sample(dummy_train, target_index)
     
     return dummy_train
-
+    
 def reconstruct_sample(args):   
     # Load client dataset and tree or create new one
     if args.client_state:
-        pass
+        client_train, client_tree = utils.load_client_state(args.client_state)
     else:
         client_train, client_tree = init_client()
+        user_input = input("Created new client dataset and tree upate. Save? [y/N]: ")
+        if user_input.lower() == 'y':
+            state_dir = Path("out/" + client_tree.fingerprint)
+            
+            if not state_dir.exists():
+                state_dir.mkdir()
+            
+            utils.save_client_state(state_dir=state_dir, client_train=client_train, client_tree=client_tree)
+            print("Saved tree and dataset at " + state_dir.absolute().as_posix())
 
     # Load dummy dataset or create new one
     if args.dummy_state:
         dummy_train = jnp.load(args.dummy_state.as_posix())
     else:
         dummy_train = init_dummy(copy.deepcopy(client_train), args.target_index)
+        user_input = input("Created new dummy train data. Save? [y/N]: ")
+        if user_input.lower() == 'y':
+            fp_dummy_train = Path(f"out/dummy_train-n{args.n_train}-{utils.smolhash(dummy_train)}.npy")
+            utils.save_dummy_state(fp_dummy_train, dummy_train)
     
     # Wrapper function to compute gradient on
     # computes diff between client tree and a tree that is freshly trained on dummy_train
@@ -136,7 +146,7 @@ def reconstruct_sample(args):
         # print(dummy_tree["left"]["value"].primal)
         print("tree diff =", d.primal)
         return d
-
+    
     # TODO: check if all attributes (including label) change during the attack
     for i in range(10):
         # Compute the gradient of diff between both trees w.r.t. input (dummy_train)
