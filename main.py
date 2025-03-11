@@ -1,13 +1,12 @@
 import json
-import itertools
 import copy
 import argparse
 import jax
+import optax
 
 import jax.numpy as jnp
 import numpy as np
 
-from jax import jit
 from sklearn.model_selection import train_test_split
 from random import seed
 from random import randrange
@@ -147,9 +146,16 @@ def reconstruct_sample(args):
         print("tree diff =", d.primal)
         return d
     
+    # Initialize Adam optimizer
+    optimizer = optax.adam(args.learning_rate)
+    opt_state = optimizer.init(dummy_train)
+    
     # TODO: check if all attributes (including label) change during the attack
-    for i in range(10):
+    for i in range(30):
+        
         # Compute the gradient of diff between both trees w.r.t. input (dummy_train)
+        # TODO: only calculate gradient for target sample row
+        # TODO: split sample and label gradient calculation?
         grad_diff = jnp.array(jax.grad(diff_wrapper)(dummy_train.tolist()))
         # print(f"sample diff (round {i}) = ", (dummy_train - client_train)[args.target_index])
 
@@ -157,8 +163,12 @@ def reconstruct_sample(args):
             print("Attack completed!")
             break
         
-        # update input by subtracting gradient
-        dummy_train = dummy_train.at[args.target_index].set((dummy_train - 0.1*grad_diff)[args.target_index])
+        # update dummy_train at index of unknown sample using adam optimizer
+        # updates, op`t_state = optimizer.update(grad_diff, opt_state)
+        # updates = o`ptax.apply_updates(dummy_train, updates)
+        
+        # dummy_train = dummy_train.at[args.target_index].set(updates[args.target_index])
+        dummy_train = dummy_train.at[args.target_index].set((dummy_train - args.learning_rate*grad_diff)[args.target_index])
         jnp.save(f"out/dummy_states/dummy_train{i}.npy", dummy_train)
 
 def parse_arguments():
@@ -167,18 +177,22 @@ def parse_arguments():
     
     parser_attack = subparsers.add_parser("attack")
     parser_stats = subparsers.add_parser("stats")
-    
-    parser_attack.add_argument('--target-index', '-t', type=int, default=0, help="Index of sample to reconstruct.")
-    parser_attack.add_argument('--client-state', '-c', type=Path, default=None, help="Existing client dataset and tree update.")
-    parser_attack.add_argument('--dummy-state', '-d', type=Path, default=None, help="Existing dummy dataset (resume attack).")
-    parser_attack.add_argument('--n-train', type=int, default=20, help="Size of new new client train set.")
-    parser_attack.add_argument('--n-test', type=int, default=10, help="Size of new new client test set.")
-    parser_attack.add_argument('--rand-state', type=int, default=43, help="Randomness for client's train/test split.")
-    parser_attack.add_argument('--max-depth', '-u', type=int, default=5, help="Upper bound for tree depth during training.")
-    parser_attack.add_argument('--min-size', '-l', type=int, default=2, help="Lower bound for no. samples after splits.")
+    group_yes_no = parser_attack.add_argument_group("Default [y/n]-prompt reply", "Automatically answer prompts with either 'y' or 'n'")
+    ex_group_yes_no = group_yes_no.add_mutually_exclusive_group()
+    ex_group_yes_no.add_argument('--no', action='store_true', help="Always decline")
+    ex_group_yes_no.add_argument('--yes', action='store_true', help="Always accept")
+    parser_attack.add_argument('--learning-rate', '--lr', type=float, default=0.1, help="Initial learning rate for Adam")
+    parser_attack.add_argument('--target-index', '-t', type=int, default=0, help="Index of sample to reconstruct")
+    parser_attack.add_argument('--client-state', '-c', type=Path, default=None, help="Existing client dataset and tree update")
+    parser_attack.add_argument('--dummy-state', '-d', type=Path, default=None, help="Existing dummy dataset (resume attack)")
+    parser_attack.add_argument('--n-train', type=int, default=20, help="Size of new new client train set")
+    parser_attack.add_argument('--n-test', type=int, default=10, help="Size of new new client test set")
+    parser_attack.add_argument('--rand-state', type=int, default=42, help="Randomness for client's train/test split")
+    parser_attack.add_argument('--max-depth', '-u', type=int, default=5, help="Upper bound for tree depth during training")
+    parser_attack.add_argument('--min-size', '-l', type=int, default=2, help="Lower bound for no. samples after splits")
     parser_attack.set_defaults(func=reconstruct_sample)
     
-    parser_stats.add_argument('--dummy-state', '-d', type=Path, help="The dummy dataset to show the attack stats for.")
+    parser_stats.add_argument('--dummy-state', '-d', type=Path, help="The dummy dataset to show the attack stats for")
     parser_stats.set_defaults(func=print_attack_stats)
 
     return parser.parse_args()
