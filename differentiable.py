@@ -1,5 +1,11 @@
+import json
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.interpreters.ad import JVPTracer
+
+from utils import smolhash
+
 
 # This isn't actually large. But large in the context of tree diff errors (at least I hope so...)
 VERY_LARGE_NUMBER = 10**3
@@ -18,9 +24,10 @@ def test_tree(tree, data):
 
 
 class DiffableTree:
-    def __init__(self, max_depth, min_size):
+    def __init__(self, max_depth=None, min_size=None, root=None):
         self.max_depth = max_depth
         self.min_size = min_size
+        self.root = root
     
     
     # Wrapper for non-instance __predict() function
@@ -41,12 +48,23 @@ class DiffableTree:
             else:
                 return node['right']
 
-    # Fit tree to 'train' data, which contains labels at last row
-    def fit(self, train):
+
+    # Fit tree to 'train' data, which contains labels at last column
+    def fit(self, train, retrain=False):
         assert type(train) == list
         
+        if self.root and not retrain:
+            raise AssertionError("Tree has already been trained. \
+                If you're sure you want to fit it again, pass 'retrain=True'.")
+        
+        if not (self.max_depth and self.min_size):
+            raise AssertionError("Attributes 'max_depth' and 'min_size' must be set before calling '.fit()'.")
+
         self.root = self.get_split(train)
         self.split(self.root, 1)
+        
+        # after tree is formed, create fingerprint
+        self.fingerprint = self.generate_fingerprint(train)
 
 
     def get_split(self, dataset):
@@ -128,7 +146,18 @@ class DiffableTree:
     # Check whether this tree instance is equal to tree instance 'tree2'
     def equals(self, tree2):
         return tree_diff(self, tree2) == 0
+
     
+    # create fingerprint from train params and tree hash
+    # trees with different fingerprints may still satisfy the .equals() function
+    def generate_fingerprint(self, train):
+        # create hash by hashing the concatenated dict and ds hashes
+        root_hash = smolhash(self)
+        train_hash = smolhash(np.array(jax.lax.stop_gradient(train))) # stop gradient during grad calculation
+        tree_hash = smolhash(root_hash + train_hash)
+        
+        return f"u{self.max_depth}-l{self.min_size}-{tree_hash}"
+
 
 # computes diff between two trees by summed squared distance of indexes/thresholds.
 # Different structure (leaf vs non-leaf) inflicts instant 'VERY_LARGE_NUMBER' damage
