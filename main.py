@@ -15,6 +15,7 @@ from pathlib import Path
 
 from differentiable import DiffableTree, tree_diff, test_tree
 import utils
+from utils import JaxTracerEncoder
 
 
 
@@ -54,28 +55,8 @@ def cross_validation_split(dataset, n_folds):
     return dataset_split
 
 
-
-def randomize_sample(data, index):
-    data = np.array(data) # convert to np incase its jnp, for in-place assignment
-    # remove label column
-    features = data[:, :-1]
-    
-    # for each feature, find lowest and highest value
-    feature_min = features.min(axis=0)
-    feature_max = features.max(axis=0)
-    
-    random_features = np.random.uniform(low=feature_min, high=feature_max)
-
-    # Randomly assign 1 or 0 to the label
-    label = np.random.choice([0, 1])
-
-    # Combine the features and label into a single data point
-    random_data_point = np.append(random_features, label)
-    data[index] = random_data_point
-    return jnp.array(data)
-
 def print_trees(t1, t2):
-    print([json.dumps(t, indent=2) for t in (t1, t2)].join('\n'))
+    print([json.dumps(t, indent=2, cls=JaxTracerEncoder) for t in (t1, t2)].join('\n'))
 
 # simple function that prints the original and the reconstructed sample and their diff
 def print_attack_stats():
@@ -97,12 +78,26 @@ def init_client():
     print(f"Built new client_tree with accuracy: {acc}")
     return client_train, client_tree
 
-def init_dummy(client_train, target_index):
-    dummy_train = copy.deepcopy(client_train)
-    dummy_train = randomize_sample(dummy_train, target_index)
+def init_dummy(client_train):
+    client_train = np.array(client_train) # convert to np incase its jnp, for in-place assignment
+    # remove label column
+    features = client_train[:, :-1]
     
-    return dummy_train
+    # for each feature, find lowest and highest value
+    feature_min = features.min(axis=0)
+    feature_max = features.max(axis=0)
     
+    # Create random features, label and append to one row
+    random_features = np.random.uniform(low=feature_min, high=feature_max)
+    random_label = np.random.choice([0, 1])
+    random_data_point = np.append(random_features, random_label)
+    
+    return jnp.array(random_data_point)
+    
+
+old_d = -1
+old_dummy_tree = None
+
 def reconstruct_sample(args):   
     # Load client dataset and tree or create new one
     if args.client_state:
@@ -119,11 +114,15 @@ def reconstruct_sample(args):
             utils.save_client_state(state_dir=state_dir, client_train=client_train, client_tree=client_tree)
             print("Saved tree and dataset at " + state_dir.absolute().as_posix())
 
+    # copy known client data (copy all, delete target)
+    known_client_train = client_train.tolist()
+    known_client_train[args.target_index] = None
+    
     # Load dummy dataset or create new one
     if args.dummy_state:
         dummy_train = jnp.load(args.dummy_state.as_posix())
     else:
-        dummy_train = init_dummy(copy.deepcopy(client_train), args.target_index)
+        dummy_train = init_dummy(copy.deepcopy(client_train))
         user_input = input("Created new dummy train data. Save? [y/N]: ")
         if user_input.lower() == 'y':
             fp_dummy_train = Path(f"out/dummy_train-n{args.n_train}-{utils.smolhash(dummy_train)}.npy")
@@ -131,11 +130,14 @@ def reconstruct_sample(args):
     
     # Wrapper function to compute gradient on
     # computes diff between client tree and a tree that is freshly trained on dummy_train
+    
     def diff_wrapper(_dummy_train):
+        global old_d, old_dummy_tree
         # train the dummy tree using '_dummy_train' data
         dummy_tree = DiffableTree(args.max_depth, args.min_size)
-        dummy_tree.fit(_dummy_train)
-        # print_trees(client_tree, dummy_tree)
+        known_client_train[args.target_index] = _dummy_train
+        dummy_tree.fit(known_client_train)
+        
         # exit()
         
         # compute the diff between the tree sent by the client and the dummy tree we just trained
@@ -144,6 +146,11 @@ def reconstruct_sample(args):
         d = tree_diff(client_tree, dummy_tree)
         # print(dummy_tree["left"]["value"].primal)
         print("tree diff =", d.primal)
+        if d.primal == old_d:
+            print_trees(old_dummy_tree, dummy_tree)
+        
+        old_d = d.primal
+        old_dummy_tree = dummy_tree
         return d
     
     # Initialize Adam optimizer
@@ -158,17 +165,17 @@ def reconstruct_sample(args):
         # TODO: split sample and label gradient calculation?
         grad_diff = jnp.array(jax.grad(diff_wrapper)(dummy_train.tolist()))
         # print(f"sample diff (round {i}) = ", (dummy_train - client_train)[args.target_index])
-
+        print("grad diff:", grad_diff)
         if not grad_diff.any():
             print("Attack completed!")
             break
         
         # update dummy_train at index of unknown sample using adam optimizer
-        # updates, op`t_state = optimizer.update(grad_diff, opt_state)
-        # updates = o`ptax.apply_updates(dummy_train, updates)
+        updates, opt_state = optimizer.update(grad_diff, opt_state)
+        updates = optax.apply_updates(dummy_train, updates)
         
-        # dummy_train = dummy_train.at[args.target_index].set(updates[args.target_index])
-        dummy_train = dummy_train.at[args.target_index].set((dummy_train - args.learning_rate*grad_diff)[args.target_index])
+        dummy_train = dummy_train.at[args.target_index].set(updates[args.target_index])
+        # dummy_train = dummy_train.at[args.target_index].set((dummy_train - args.learning_rate*grad_diff)[args.target_index])
         jnp.save(f"out/dummy_states/dummy_train{i}.npy", dummy_train)
 
 def parse_arguments():
@@ -187,7 +194,7 @@ def parse_arguments():
     parser_attack.add_argument('--dummy-state', '-d', type=Path, default=None, help="Existing dummy dataset (resume attack)")
     parser_attack.add_argument('--n-train', type=int, default=20, help="Size of new new client train set")
     parser_attack.add_argument('--n-test', type=int, default=10, help="Size of new new client test set")
-    parser_attack.add_argument('--rand-state', type=int, default=42, help="Randomness for client's train/test split")
+    parser_attack.add_argument('--rand-state', type=int, default=43, help="Randomness for client's train/test split")
     parser_attack.add_argument('--max-depth', '-u', type=int, default=5, help="Upper bound for tree depth during training")
     parser_attack.add_argument('--min-size', '-l', type=int, default=2, help="Lower bound for no. samples after splits")
     parser_attack.set_defaults(func=reconstruct_sample)
