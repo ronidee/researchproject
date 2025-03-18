@@ -55,8 +55,8 @@ def cross_validation_split(dataset, n_folds):
     return dataset_split
 
 
-def print_trees(t1, t2):
-    print([json.dumps(t, indent=2, cls=JaxTracerEncoder) for t in (t1, t2)].join('\n'))
+def print_trees(*trees):
+    print('\n'.join([json.dumps(t, indent=2, cls=JaxTracerEncoder) for t in trees]))
 
 # simple function that prints the original and the reconstructed sample and their diff
 def print_attack_stats():
@@ -67,8 +67,10 @@ def print_attack_stats():
 
 
 # diff_wrapper(dummy_train.tolist())
+client_test = None
 
 def init_client():
+    global client_test
     # Create "original" client dataset and tree update
     client_train, client_test = train_test_split(dataset, train_size=args.n_train, test_size=args.n_test, random_state=args.rand_state)
     client_tree = DiffableTree(max_depth=args.max_depth, min_size=args.min_size)
@@ -114,6 +116,7 @@ def reconstruct_sample(args):
             utils.save_client_state(state_dir=state_dir, client_train=client_train, client_tree=client_tree)
             print("Saved tree and dataset at " + state_dir.absolute().as_posix())
 
+
     # copy known client data (copy all, delete target)
     known_client_train = client_train.tolist()
     known_client_train[args.target_index] = None
@@ -132,6 +135,8 @@ def reconstruct_sample(args):
     # computes diff between client tree and a tree that is freshly trained on dummy_train
     
     def diff_wrapper(_dummy_train):
+        diff_test_data = client_test.tolist()
+        diff_test_data.append(jax.lax.stop_gradient(_dummy_train))
         global old_d, old_dummy_tree
         # train the dummy tree using '_dummy_train' data
         dummy_tree = DiffableTree(args.max_depth, args.min_size)
@@ -143,14 +148,14 @@ def reconstruct_sample(args):
         # compute the diff between the tree sent by the client and the dummy tree we just trained
         # this will be used to adapt the dummy data so that the new dummy_tree will resemble the client
         # tree more closely.
-        d = tree_diff(client_tree, dummy_tree)
+        d = tree_diff(client_tree, dummy_tree, diff_test_data)
         # print(dummy_tree["left"]["value"].primal)
         print("tree diff =", d.primal)
-        if d.primal == old_d:
-            print_trees(old_dummy_tree, dummy_tree)
+        # if d.primal == old_d:
+        #     print_trees(old_dummy_tree, dummy_tree)
         
-        old_d = d.primal
-        old_dummy_tree = dummy_tree
+        # old_d = d.primal
+        # old_dummy_tree = dummy_tree
         return d
     
     # Initialize Adam optimizer
@@ -158,14 +163,13 @@ def reconstruct_sample(args):
     opt_state = optimizer.init(dummy_train)
     
     # TODO: check if all attributes (including label) change during the attack
-    for i in range(30):
-        
+    for i in range(500):
         # Compute the gradient of diff between both trees w.r.t. input (dummy_train)
         # TODO: only calculate gradient for target sample row
         # TODO: split sample and label gradient calculation?
         grad_diff = jnp.array(jax.grad(diff_wrapper)(dummy_train.tolist()))
         # print(f"sample diff (round {i}) = ", (dummy_train - client_train)[args.target_index])
-        print("grad diff:", grad_diff)
+        # print("grad diff:", grad_diff)
         if not grad_diff.any():
             print("Attack completed!")
             break

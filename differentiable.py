@@ -8,7 +8,7 @@ from utils import smolhash
 
 
 # This isn't actually large. But large in the context of tree diff errors (at least I hope so...)
-VERY_LARGE_NUMBER = 10**3
+VERY_LARGE_NUMBER = 10**0
 
 # Calculate accuracy percentage
 def accuracy_metric(actual, predicted):
@@ -163,7 +163,14 @@ class DiffableTree:
 # Different structure (leaf vs non-leaf) inflicts instant 'VERY_LARGE_NUMBER' damage
 # @param level: level in the tree hierachy (root node=0), so we know when to sum up. Could replace by always summing up. TODO!
 # TODO: remove dependence on same random seed during training
-def tree_diff(tree1, tree2, level=0):
+def tree_diff(tree1, tree2, client_test, level=0):
+    preds_1 = [tree1.predict(sample) for sample in client_test]
+    preds_2 = [tree2.predict(sample) for sample in client_test]
+
+    print(preds_1, "\n", preds_2)
+    print(np.sum(np.array(preds_1) - np.array(preds_2)))
+    exit()
+
     # extract tree structure (dict) from instance
     if isinstance(tree1, DiffableTree): tree1 = tree1.root
     if isinstance(tree2, DiffableTree): tree2 = tree2.root
@@ -174,7 +181,7 @@ def tree_diff(tree1, tree2, level=0):
     for v1, v2 in zip(tree1.values(), tree2.values()):
         # this indicates, that one tree has a leaf node, while the other has not
         if not same_type(v1, v2):
-            errors.append(VERY_LARGE_NUMBER)
+            errors.append(VERY_LARGE_NUMBER * (1/(level+1)))
             
             if type(v1) == dict:
                 # replace v2 by dummy tree to resume traversing v1
@@ -182,10 +189,13 @@ def tree_diff(tree1, tree2, level=0):
             else:
                 # replace v2 with v1, so the error will be 0, since we already added the VERY_LARGE_NUMBER penalty
                 v2 = v1
-        if isinstance(v1, dict):
+
+        if isinstance(v1, dict): # calculate difference for the subtree
             errors.extend(tree_diff(v1, v2, level=level+1))
-        else:
-            errors.append((v1-v2)**2) # Note: For high feature counts, this could cause overshoots
+        elif isinstance(v1, int): # calculate difference for index selection
+            errors.append(int(v1 != v2) * VERY_LARGE_NUMBER * (1/(level+1))) # Note: For high feature counts, this could cause overshoots
+        elif isinstance(v1, float):
+            errors.append(jnp.pow(v1-v2, 2))
     
     # return sum of aggregated errors
     return jnp.sum(jnp.array(errors)) if level == 0 else errors
