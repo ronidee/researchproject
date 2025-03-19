@@ -163,13 +163,13 @@ class DiffableTree:
 # Different structure (leaf vs non-leaf) inflicts instant 'VERY_LARGE_NUMBER' damage
 # @param level: level in the tree hierachy (root node=0), so we know when to sum up. Could replace by always summing up. TODO!
 # TODO: remove dependence on same random seed during training
-def tree_diff(tree1, tree2, client_test, level=0):
-    preds_1 = [tree1.predict(sample) for sample in client_test]
-    preds_2 = [tree2.predict(sample) for sample in client_test]
+def tree_diff(tree1, tree2, level=0):#client_test, level=0):
+    # preds_1 = [tree1.predict(sample) for sample in client_test]
+    # preds_2 = [tree2.predict(sample) for sample in client_test]
 
-    print(preds_1, "\n", preds_2)
-    print(np.sum(np.array(preds_1) - np.array(preds_2)))
-    exit()
+    # print(preds_1, "\n", preds_2)
+    # print(np.sum(np.array(preds_1) - np.array(preds_2)))
+    # exit()
 
     # extract tree structure (dict) from instance
     if isinstance(tree1, DiffableTree): tree1 = tree1.root
