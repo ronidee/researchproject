@@ -60,20 +60,16 @@ def print_trees(*trees):
 
 # simple function that prints the original and the reconstructed sample and their diff
 def print_attack_stats(args):
-    print("WARNING! USING STATIC TREE PARAMS FOR DUMMY TREE! TODO: STORE IN CONFIG")
-    # dummy_sample = utils.load_dummy_state(state_dir=args.dummy_state)
+    dummy_sample, dummy_tree = utils.load_dummy_state(state_dir=args.dummy_state)
     client_train, client_tree = utils.load_client_state(state_dir=args.client_state)
-    # dummy_tree = DiffableTree(max_depth=5, min_size=2)
+    dummy_sample = dummy_sample
+    client_train = client_train
     
-    # dummy_train = client_train.tolist()
-    # dummy_train[0] = dummy_sample.tolist()
+    print("Original sample:\t", client_train[args.target_index])
+    print("Reconst. sample:\t", dummy_sample)
+    print("Pairwise diff.:\t", client_train[args.target_index] - dummy_sample)
     
-    # dummy_tree.fit(dummy_train)
-    # print("Original sample:\t", client_train[0])
-    # print("Reconst. sample:\t", dummy_sample)
-    # print("Pairwise diff.:\t", client_train[0] - dummy_sample)
-    
-    utils.visualize_tree(client_tree.root, args.client_state / "client_tree", view=True)
+    utils.visualize_tree(client_tree=client_tree.root, dummy_tree=dummy_tree.root, fp_out=args.client_state / "client_tree", view=True)
 
 # diff_wrapper(dummy_sample.tolist())
 
@@ -118,8 +114,7 @@ def reconstruct_sample(args):
             
             utils.save_client_state(state_dir=state_dir, client_train=client_train, client_tree=client_tree)
             print("Saved tree and dataset at " + state_dir.absolute().as_posix())
-
-
+    
     # copy known client data (copy all, delete target)
     known_client_train = client_train.tolist()
     known_client_train[args.target_index] = None
@@ -133,18 +128,18 @@ def reconstruct_sample(args):
         if user_input.lower() == 'y':
             # store initial dummy sample (which is random) at iteration-0
             attack_state_dir = Path("out/" + client_tree.fingerprint).joinpath(f"target-{args.target_index}")
-            test = attack_state_dir / "0/"
-            utils.save_dummy_state(state_dir=attack_state_dir / "0", dummy_sample=dummy_sample)
+            utils.save_dummy_state(state_dir=attack_state_dir / "0", dummy_sample=dummy_sample, ignore_conflicts=True)
     
     # Wrapper function to compute gradient on
     # computes diff between client tree and a tree that is freshly trained on dummy_train
     
-    def diff_wrapper(_dummy_sample):
+    def diff_wrapper(_dummy_sample, _attack_snapshot_dir):
         # train the dummy tree using known part of client data and '_dummy_sample'
-        dummy_train = known_client_train
+        dummy_train = copy.deepcopy(known_client_train)
         dummy_train[args.target_index] = _dummy_sample
         dummy_tree = DiffableTree(max_depth=args.max_depth, min_size=args.min_size)
-        dummy_tree.fit(known_client_train)
+        dummy_tree.fit(dummy_train)
+        utils.save_dummy_state(state_dir=_attack_snapshot_dir, dummy_tree=dummy_tree, ignore_conflicts=True)
         
         # compute the diff between the tree sent by the client and the dummy tree we just trained
         # this will be used to adapt the dummy data so that the new dummy_tree will resemble the client
@@ -160,11 +155,13 @@ def reconstruct_sample(args):
     # TODO: check if all attributes (including label) change during the attack
     attack_state_dir = Path("out/") / client_tree.fingerprint / f"target-{args.target_index}"
     for i in range(500):
+        tree_snapshot_dir = attack_state_dir / str(i) # based on previous dummy_sample
+        sample_snapshot_dir = attack_state_dir / str(i+1) # +1, since random is "/0/"
+        
         # Compute the gradient of diff between both trees w.r.t. input (dummy_sample)
         # TODO: only calculate gradient for target sample row
         # TODO: split sample and label gradient calculation?
-        grad_diff = jnp.array(jax.grad(diff_wrapper)(dummy_sample.tolist()))
-        # print(f"sample diff (round {i}) = ", (dummy_sample - client_train)[args.target_index])
+        grad_diff = jnp.array(jax.grad(diff_wrapper)(dummy_sample.tolist(), tree_snapshot_dir))
         # print("grad diff:", grad_diff)
         if not grad_diff.any():
             print("Attack completed!")
@@ -172,15 +169,18 @@ def reconstruct_sample(args):
         
         # update dummy_sample using adam optimizer
         updates, opt_state = optimizer.update(grad_diff, opt_state)
+        print("grad_diff", grad_diff, "\nupdates:", updates)
         updates = optax.apply_updates(dummy_sample, updates)
         dummy_sample = updates
         # dummy_sample = dummy_sample - args.learning_rate*grad_diff
         
-        utils.save_dummy_state(state_dir=attack_state_dir / str(i+1), dummy_sample=dummy_sample)
+        # save current state of reconstructed sample
+        utils.save_dummy_state(state_dir=sample_snapshot_dir, dummy_sample=dummy_sample, ignore_conflicts=True)
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(required=True)
+    parser.add_argument('--target-index', '-t', type=int, default=0, help="Index of sample to reconstruct")
     
     parser_attack = subparsers.add_parser("attack")
     parser_stats = subparsers.add_parser("stats")
@@ -189,7 +189,6 @@ def parse_arguments():
     ex_group_yes_no.add_argument('--no', action='store_true', help="Always decline")
     ex_group_yes_no.add_argument('--yes', action='store_true', help="Always accept")
     parser_attack.add_argument('--learning-rate', '--lr', type=float, default=0.1, help="Initial learning rate for Adam")
-    parser_attack.add_argument('--target-index', '-t', type=int, default=0, help="Index of sample to reconstruct")
     parser_attack.add_argument('--client-state', '-c', type=Path, default=None, help="Existing client dataset and tree update")
     parser_attack.add_argument('--dummy-state', '-d', type=Path, default=None, help="Existing dummy dataset (resume attack)")
     parser_attack.add_argument('--n-train', type=int, default=20, help="Size of new new client train set")
@@ -201,7 +200,7 @@ def parse_arguments():
     
     parser_stats.add_argument('--dummy-state', '-d', type=Path, help="The dummy dataset to show the attack stats for")
     parser_stats.add_argument('--client-state', '-c', type=Path, default=None, help="Existing client dataset and tree update")
-
+    
     parser_stats.set_defaults(func=print_attack_stats)
 
     return parser.parse_args()
