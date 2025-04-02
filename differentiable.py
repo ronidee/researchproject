@@ -1,8 +1,6 @@
 import json
 import jax
-import jax.numpy as jnp
-import numpy as np
-from jax.interpreters.ad import JVPTracer
+import numpy
 
 from utils import smolhash
 
@@ -24,11 +22,16 @@ def test_tree(tree, data):
 
 
 class DiffableTree:
-    def __init__(self, max_depth=None, min_size=None, root=None):
+    def __init__(self, max_depth=None, min_size=None, root=None, trace=True):
         self.max_depth = max_depth
         self.min_size = min_size
         self.root = root
+        self.trace = trace
+        
     
+    @property
+    def xp(self):
+        return jax.numpy if self.trace else numpy
     
     # Wrapper for non-instance __predict() function
     def predict(self, row):
@@ -51,7 +54,7 @@ class DiffableTree:
 
     # Fit tree to 'train' data, which contains labels at last column
     def fit(self, train, retrain=False):
-        assert type(train) == list
+        assert type(train) != list
         
         if self.root and not retrain:
             raise AssertionError("Tree has already been trained. \
@@ -68,80 +71,71 @@ class DiffableTree:
 
 
     def get_split(self, dataset):
-        class_values = list(jnp.unique(jnp.array(list(row[-1] for row in dataset))))
-        b_index, b_value, b_score, b_groups = 999, 999, 999, None
-        for index in range(len(dataset[0])-1):
+        class_values = self.xp.unique(dataset[:, -1])
+
+        b_index, b_value, b_score, b_groups = None, None, float('inf'), None
+        for index in range(dataset.shape[1] - 1):
             for row in dataset:
                 groups = self.test_split(index, row[index], dataset)
                 gini = self.gini_index(groups, class_values)
                 if gini < b_score:
                     b_index, b_value, b_score, b_groups = index, row[index], gini, groups
-        return {'index':b_index, 'value':b_value, 'groups':b_groups}
+        return {'index': b_index, 'value': b_value, 'groups': b_groups}
 
-
+    
     # Split a dataset based on an attribute and an attribute value
     def test_split(self, index, value, dataset):
-        left, right = list(), list()
-        for row in dataset:
-            if row[index] < value:
-                left.append(row)
-            else:
-                right.append(row)
-        return left, right
-    
+        mask = dataset[:, index] < value
+        return dataset[mask], dataset[~mask]
+
     
     def split(self, node, depth):
-        left, right = node['groups']
-        del(node['groups'])
+        left, right = node.pop('groups')
+
         # check for a no split
-        if not left or not right:
-            node['left'] = node['right'] = self.to_terminal(left + right)
+        if left.size == 0 or right.size == 0:
+            node['left'] = node['right'] = self.to_terminal(self.xp.vstack((left, right)))
             return
+        
         # check for max depth
         if depth >= self.max_depth:
             node['left'], node['right'] = self.to_terminal(left), self.to_terminal(right)
             return
+
         # process left child
-        if len(left) <= self.min_size:
-            node['left'] = self.to_terminal(left)
-        else:
-            node['left'] = self.get_split(left)
-            self.split(node['left'], depth+1)
+        node['left'] = self.to_terminal(left) if len(left) <= self.min_size else self.get_split(left)
+        if isinstance(node['left'], dict):
+            # not a terminal node, keep processing
+            self.split(node['left'], depth + 1)
+
         # process right child
-        if len(right) <= self.min_size:
-            node['right'] = self.to_terminal(right)
-        else:
-            node['right'] = self.get_split(right)
-            self.split(node['right'], depth+1)
+        node['right'] = self.to_terminal(right) if len(right) <= self.min_size else self.get_split(right)
+        if isinstance(node['right'], dict):
+            # not a terminal node, keep processing
+            self.split(node['right'], depth + 1)
 
 
     # Create a terminal node value
     def to_terminal(self, group):
-        outcomes = [row[-1] for row in group]
-        return max(jnp.unique(jnp.array(outcomes)).tolist(), key=outcomes.count)
+        outcomes = group[:, -1]
+        unique, counts = self.xp.unique(outcomes, return_counts=True)
+        return unique[self.xp.argmax(counts)]
 
 
     # TODO: check if diffrent split values have same gini index
-    # Calculate the Gini index for a split dataset
     def gini_index(self, groups, classes):
-        # count all samples at split point
-        n_instances = float(sum([len(group) for group in groups]))
-        # sum weighted Gini index for each group
+        n_instances = sum(len(group) for group in groups)
         gini = 0.0
+
         for group in groups:
-            size = float(len(group))
-            # avoid divide by zero
+            size = len(group)
             if size == 0:
                 continue
-            score = 0.0
-            # score the group based on the score for each class
-            for class_val in classes:
-                p = [row[-1] for row in group].count(class_val) / size
-                score += p * p
-            # weight the group score by its relative size
-            gini += (1.0 - score) * (size / n_instances)
+            proportions = self.xp.array([(group[:, -1] == class_val).sum() / size for class_val in classes])
+            gini += (1.0 - self.xp.sum(proportions ** 2)) * (size / n_instances)
+
         return gini
-    
+
     
     # Check whether this tree instance is equal to tree instance 'tree2'
     def equals(self, tree2):
@@ -153,7 +147,7 @@ class DiffableTree:
     def generate_fingerprint(self, train):
         # create hash by hashing the concatenated dict and ds hashes
         root_hash = smolhash(self)
-        train_hash = smolhash(np.array(jax.lax.stop_gradient(train))) # stop gradient during grad calculation
+        train_hash = smolhash(self.xp.array(jax.lax.stop_gradient(train))) # stop gradient during grad calculation
         tree_hash = smolhash(root_hash + train_hash)
         
         return f"u{self.max_depth}-l{self.min_size}-{tree_hash}"
@@ -195,15 +189,21 @@ def tree_diff(tree1, tree2, level=0):#client_test, level=0):
         elif isinstance(v1, int): # calculate difference for index selection
             errors.append(int(v1 != v2) * VERY_LARGE_NUMBER * (1/(level+1))) # Note: For high feature counts, this could cause overshoots
         elif isinstance(v1, float):
-            errors.append(jnp.pow(v1-v2, 2))
+            errors.append(jax.numpy.pow(v1-v2, 2))
     
     # return sum of aggregated errors
-    return jnp.sum(jnp.array(errors)) if level == 0 else errors
+    return jax.numpy.sum(jax.numpy.array(errors)) if level == 0 else errors
 
     
 # DANGEROUS: expects only 'b' to ever be traced by JAX
 def same_type(a, b):
     # Check if a, b have same type or, if not and b is wrapped 
     # in a Tracer object, if a and b's wrapped variable have same type
+    if (isinstance(b, jax._src.interpreters.ad.JVPTracer)):
+        x = type(a.item())
+        y = type(b.primal.item())
+        z = x==y
+        print("x:", x, "y:", y, "z:", z)
+        
     return type(a) == type(b) \
-        or (isinstance(b, jax._src.interpreters.ad.JVPTracer) and type(a) == type(b.primal))
+        or (isinstance(b, jax._src.interpreters.ad.JVPTracer) and type(a.item()) == type(b.primal.item()))

@@ -6,7 +6,8 @@ import optax
 
 import jax.numpy as jnp
 import numpy as np
-
+# print("WARNING!")
+# jnp=np
 from sklearn.model_selection import train_test_split
 from random import seed
 from random import randrange
@@ -34,7 +35,11 @@ def load_dataset():
     # convert string attributes to integers
     for i in range(len(dataset[0])):
         str_column_to_float(dataset, i)
-    return jnp.array(dataset)
+        
+    # convert to float32, to avoid 64->32 conversion to jax (doesn't support 64 by default)
+    dataset = np.array(dataset, dtype=np.float32)
+    # dataset[:, :-1] = dataset[:, :-1].astype(np.float32)
+    return dataset
 
 # Convert string column to float
 def str_column_to_float(dataset, column):
@@ -62,29 +67,27 @@ def print_trees(*trees):
 def print_attack_stats(args):
     dummy_sample, dummy_tree = utils.load_dummy_state(state_dir=args.dummy_state)
     client_train, client_tree = utils.load_client_state(state_dir=args.client_state)
-    dummy_sample = dummy_sample
-    client_train = client_train
     
     print("Original sample:\t", client_train[args.target_index])
     print("Reconst. sample:\t", dummy_sample)
     print("Pairwise diff.:\t", client_train[args.target_index] - dummy_sample)
     
-    utils.visualize_tree(client_tree=client_tree.root, dummy_tree=dummy_tree.root, fp_out=args.client_state / "client_tree", view=True)
-
-# diff_wrapper(dummy_sample.tolist())
+    utils.visualize_tree(
+        client_tree=client_tree.root,
+        dummy_tree=dummy_tree.root,
+        fp_out=args.dummy_state / "client_vs_dummy", view=True)
 
 def init_client():
     # Create "original" client dataset and tree update
     client_train, client_test = train_test_split(dataset, train_size=args.n_train, test_size=args.n_test, random_state=args.rand_state)
-    client_tree = DiffableTree(max_depth=args.max_depth, min_size=args.min_size)
-    client_tree.fit(client_train.tolist())
+    client_tree = DiffableTree(max_depth=args.max_depth, min_size=args.min_size, trace=False)
+    client_tree.fit(client_train)
     acc = test_tree(client_tree, client_test)
     print(f"Built new client_tree with accuracy: {acc}")
-    
+
     return client_train, client_tree
 
 def init_dummy(client_train):
-    client_train = np.array(client_train) # convert to np incase its jnp, for in-place assignment
     # remove label column
     features = client_train[:, :-1]
     
@@ -116,14 +119,15 @@ def reconstruct_sample(args):
             print("Saved tree and dataset at " + state_dir.absolute().as_posix())
     
     # copy known client data (copy all, delete target)
-    known_client_train = client_train.tolist()
-    known_client_train[args.target_index] = None
+    dummy_train = copy.deepcopy(client_train)
+    dummy_train[args.target_index] = 0 # delete sample to attack
+    dummy_train = jnp.array(dummy_train)
     
     # Load dummy sample or create new one
     if args.dummy_state:
         dummy_sample = jnp.load(args.dummy_state.as_posix())
     else:
-        dummy_sample = init_dummy(copy.deepcopy(client_train))
+        dummy_sample = init_dummy(dummy_train)
         user_input = input("Created new dummy train data. Save? [y/N]: ")
         if user_input.lower() == 'y':
             # store initial dummy sample (which is random) at iteration-0
@@ -135,17 +139,16 @@ def reconstruct_sample(args):
     
     def diff_wrapper(_dummy_sample, _attack_snapshot_dir):
         # train the dummy tree using known part of client data and '_dummy_sample'
-        dummy_train = copy.deepcopy(known_client_train)
-        dummy_train[args.target_index] = _dummy_sample
+        _dummy_train = dummy_train.at[args.target_index].set(_dummy_sample)
         dummy_tree = DiffableTree(max_depth=args.max_depth, min_size=args.min_size)
-        dummy_tree.fit(dummy_train)
+        dummy_tree.fit(_dummy_train)
         utils.save_dummy_state(state_dir=_attack_snapshot_dir, dummy_tree=dummy_tree, ignore_conflicts=True)
         
         # compute the diff between the tree sent by the client and the dummy tree we just trained
         # this will be used to adapt the dummy data so that the new dummy_tree will resemble the client
         # tree more closely.
         d = tree_diff(client_tree, dummy_tree)
-        print("tree diff =", d.primal)
+        print("tree diff =", d)#.primal)
         return d
     
     # Initialize Adam optimizer
@@ -161,7 +164,7 @@ def reconstruct_sample(args):
         # Compute the gradient of diff between both trees w.r.t. input (dummy_sample)
         # TODO: only calculate gradient for target sample row
         # TODO: split sample and label gradient calculation?
-        grad_diff = jnp.array(jax.grad(diff_wrapper)(dummy_sample.tolist(), tree_snapshot_dir))
+        grad_diff = jnp.array(jax.grad(diff_wrapper)(dummy_sample, tree_snapshot_dir))
         # print("grad diff:", grad_diff)
         if not grad_diff.any():
             print("Attack completed!")

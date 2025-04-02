@@ -13,6 +13,8 @@ class JaxTracerEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, JVPTracer):
             return o.primal
+        elif isinstance(o, jnp.ndarray) and o.size == 1 or isinstance(o, np.float32):
+            return o.item()
         else:
             return o
 
@@ -62,7 +64,7 @@ def save_client_state(state_dir, client_train, client_tree):
     
     # save tree as json, if file doesn't exist or user doesn't care
     if get_ok_to_write_file(fp_client_tree):
-        fp_client_tree.write_text(json.dumps(client_tree.root, indent=2))
+        fp_client_tree.write_text(json.dumps(client_tree.root, indent=2, cls=JaxTracerEncoder))
     
     # save train data as npy, if file doesn't exist or user doesn't care
     if get_ok_to_write_file(fp_client_train):
@@ -126,3 +128,4 @@ def visualize_tree(client_tree, dummy_tree=None, fp_out=None, view=False):
             add_node(dummy_tree, subgraph=sub2)
 
     dot.render(fp_out, cleanup=True, view=view, format="png")
+    print("Saved tree diagram at:", fp_out.with_suffix(".png").absolute().as_posix())
