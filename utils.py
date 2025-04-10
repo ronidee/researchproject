@@ -4,19 +4,11 @@ import numpy as np
 from pathlib import Path
 import graphviz
 from hashlib import md5
-from jax.interpreters.ad import JVPTracer
 
 import differentiable
 
 
-class JaxTracerEncoder(json.JSONEncoder):
-    def default(self, o):
-        if isinstance(o, JVPTracer):
-            return o.primal
-        elif isinstance(o, jnp.ndarray) and o.size == 1 or isinstance(o, np.float32):
-            return o.item()
-        else:
-            return o
+
 
 
 # not a secure hash function. only use for fingerprints/filenames
@@ -31,7 +23,7 @@ def smolhash(something):
     elif isinstance(something, jnp.ndarray):
         something = np.array(something).data.tobytes()
     elif isinstance(something, differentiable.DiffableTree):
-        something = json.dumps(something.root, cls=JaxTracerEncoder).encode('utf-8')
+        something = json.dumps(something.root, cls=differentiable.JaxTracerEncoder).encode('utf-8')
     elif not isinstance(something, bytes):
         raise TypeError("Argument 'something' must be str, int, float, bytes, numpy.ndarray, jax.numpy.ndarray or differentiable.DiffableTree")
     
@@ -51,11 +43,12 @@ def get_ok_to_write_file(fp, create_dir=False, ignore_exist=False):
 
 def load_client_state(state_dir):
     # load client tree (json) and train dataset (npy)
-    client_tree_root = json.loads((state_dir / "client_tree.json").read_text())
-    client_train = jnp.load((state_dir / "client_train.npy"))
+    tree_data=(state_dir / "client_tree.json").read_text()
+    client_tree = differentiable.DiffableTree.from_json(tree_data)
+    client_train = np.load((state_dir / "client_train.npy")).astype(np.float32)
 
     # Build DiffableTree instance from tree dict and return client dataset, tree
-    return client_train, differentiable.DiffableTree(root=client_tree_root)
+    return client_train, client_tree
 
 def save_client_state(state_dir, client_train, client_tree):
     # Create file pointers for saving ds and tree 
@@ -64,7 +57,7 @@ def save_client_state(state_dir, client_train, client_tree):
     
     # save tree as json, if file doesn't exist or user doesn't care
     if get_ok_to_write_file(fp_client_tree):
-        fp_client_tree.write_text(json.dumps(client_tree.root, indent=2, cls=JaxTracerEncoder))
+        fp_client_tree.write_text(client_tree.to_json())
     
     # save train data as npy, if file doesn't exist or user doesn't care
     if get_ok_to_write_file(fp_client_train):
@@ -72,11 +65,20 @@ def save_client_state(state_dir, client_train, client_tree):
 
 def load_dummy_state(state_dir):
     # load dummy tree (json) and attack sample (npy)
-    dummy_tree_root = json.loads((state_dir / "dummy_tree.json").read_text())
-    dummy_sample = jnp.load(state_dir / "dummy_sample.npy")
+    fp_tree = state_dir / "dummy_tree.json"
+    fp_sample = state_dir / "dummy_sample.npy"
+    
+    dummy_sample = dummy_tree = None
+    
+    if fp_tree.exists():
+        tree_data = (state_dir / "dummy_tree.json").read_text()
+        dummy_tree = differentiable.DiffableTree.from_json(tree_data)
+    
+    if fp_sample.exists():
+        dummy_sample = jnp.load(fp_sample).astype(np.float32)
     
     # Build DiffableTree instance from tree dict and return dummy sample, tree
-    return dummy_sample, differentiable.DiffableTree(root=dummy_tree_root)
+    return dummy_sample, dummy_tree
 
 def save_dummy_state(state_dir, dummy_sample=None, dummy_tree=None, ignore_conflicts=False):
     # File pointer for saving dummy train data
@@ -88,7 +90,7 @@ def save_dummy_state(state_dir, dummy_sample=None, dummy_tree=None, ignore_confl
     if dummy_tree != None:
         fp_dummy_tree = state_dir / "dummy_tree.json"
         if get_ok_to_write_file(fp_dummy_tree, create_dir=ignore_conflicts, ignore_exist=ignore_conflicts):
-            fp_dummy_tree.write_text(json.dumps(dummy_tree.root, indent=2, cls=JaxTracerEncoder))
+            fp_dummy_tree.write_text(dummy_tree.to_json())
 
 # Visualize and render the tree.
 def visualize_tree(client_tree, dummy_tree=None, fp_out=None, view=False):
