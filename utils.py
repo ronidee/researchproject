@@ -1,16 +1,19 @@
 import json
 import jax.numpy as jnp
 import numpy as np
-from pathlib import Path
 import graphviz
 from hashlib import md5
 
 import differentiable
 
 
+AUTOREPLY = None
 
 
-
+def ask_yes_no(prompt):
+    user_input =  AUTOREPLY if AUTOREPLY else input(prompt + " [y/N]: ")
+    return user_input.lower() == 'y'
+    
 # not a secure hash function. only use for fingerprints/filenames
 # returns the first 7 chars form the hexencoded md5 hash of 'something'
 def smolhash(something):
@@ -31,14 +34,12 @@ def smolhash(something):
 
 def get_ok_to_write_file(fp, create_dir=False, ignore_exist=False):
     if not ignore_exist and fp.exists():
-        user_input = input(f"File already exists! Overwrite? ({fp.absolute().as_posix()}) [y/N]: ")
-        return user_input.lower() == 'y'
+        return ask_yes_no(f"File already exists! Overwrite? ({fp.absolute().as_posix()})")
     elif fp.parent.exists():
         return True
-    elif create_dir or input(f"Directory doesn't exist. Create? ({fp.parent.absolute().as_posix()}) [y/N]: ").lower() == 'y':
+    elif create_dir or ask_yes_no(f"Directory doesn't exist. Create? ({fp.parent.absolute().as_posix()})"):
         fp.parent.mkdir(parents=True)
         return True
-    
     return False
 
 def load_client_state(state_dir):
@@ -93,7 +94,13 @@ def save_dummy_state(state_dir, dummy_sample=None, dummy_tree=None, ignore_confl
             fp_dummy_tree.write_text(dummy_tree.to_json())
 
 # Visualize and render the tree.
-def visualize_tree(client_tree, dummy_tree=None, fp_out=None, view=False):
+def visualize_tree(tree1, tree2=None, labels=("Client Tree", "Dummy Tree"), fp_out=None, view=False):
+    if tree1 == tree2 == None:
+        raise ValueError("Need at least one tree to plot but tree1 and tree2 are None.")
+    
+    if isinstance(tree1, differentiable.DiffableTree): tree1 = tree1.root 
+    if isinstance(tree2, differentiable.DiffableTree): tree2 = tree2.root 
+    
     dot = graphviz.Digraph()
     node_id_counter = [0]  # mutable counter for unique node IDs
 
@@ -120,14 +127,14 @@ def visualize_tree(client_tree, dummy_tree=None, fp_out=None, view=False):
 
     # Create a subgraph for the first tree
     with dot.subgraph(name="cluster_0") as sub1:
-        sub1.attr(label="Client Tree")
-        add_node(client_tree, subgraph=sub1)
+        sub1.attr(label=labels[0])
+        add_node(tree1, subgraph=sub1)
 
-    if dummy_tree:
+    if tree2:
         # Create a subgraph for the second tree
         with dot.subgraph(name="cluster_1") as sub2:
-            sub2.attr(label="Dummy Tree")
-            add_node(dummy_tree, subgraph=sub2)
+            sub2.attr(label=labels[1])
+            add_node(tree2, subgraph=sub2)
 
     dot.render(fp_out, cleanup=True, view=view, format="png")
     print("Saved tree diagram at:", fp_out.with_suffix(".png").absolute().as_posix())

@@ -1,8 +1,8 @@
 import jax
 import json
 import numpy
-import itertools
-import pandas as pd
+import jax.numpy as jnp
+from jax.lax import cond
 from jax.interpreters.ad import JVPTracer
 
 from utils import smolhash
@@ -12,32 +12,34 @@ class JaxTracerEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, JVPTracer):
             return o.primal
-        elif isinstance(o, jnp.ndarray) and o.size == 1 or isinstance(o, numpy.float32):
+        elif (isinstance(o, (jax.numpy.ndarray, numpy.ndarray)) and o.size == 1) or isinstance(o, numpy.float32):
+            return o.item()
+        elif isinstance(o, numpy.int32):
             return o.item()
         else:
             return o
 
+# Check if a subset (selection of dataset in form of a boolean mask) is empty
+def is_empty(mask):
+    res = jnp.sum(mask) == 0
+    return res
 
-# This isn't actually large. But large in the context of tree diff errors (at least I hope so...)
-VERY_LARGE_NUMBER = 10**0
 
-# Calculate accuracy percentage
+def diffable_subset_mean(arr, mask):
+    mean = jnp.sum(jnp.where(mask, arr, 0.0)) / (jnp.sum(mask) + 1e-8)
+    return mean
+
+
 def mse(actual, predicted, xp=numpy):
     return xp.mean((actual - predicted) ** 2)
+
 
 def mae(actual, predicted):
     return numpy.mean(numpy.abs(actual - predicted))
 
+
 def test_tree(tree, data):
-    predictions = [tree.predict(sample) for sample in data[:, :-1]]
-    
-    # # Create a readable table
-    # results = pd.DataFrame({
-    #     'Actual': data[:, -1],
-    #     'Predicted': predictions,
-    #     'Error': data[:, -1] - predictions
-    # })
-    # print(results.head(10).to_string(index=False)) 
+    predictions = numpy.array([tree.predict(sample) for sample in data[:, :-1]])
     return {
         'mse': mse(data[:, -1], predictions),
         'mae': mae(data[:, -1], predictions)
@@ -50,22 +52,19 @@ class DiffableTree:
         self.min_size = min_size
         self.root = root
         self.trace = trace
-        
+
         if root:
             assert fingerprint # loading trained tree requires original fingerprint
             self.fingerprint = fingerprint
         
-    
     @property
     def xp(self):
         return jax.numpy if self.trace else numpy
-    
     
     # Wrapper for non-instance __predict() function
     def predict(self, row):
         return self.__predict(self.root, row)
 
-    
     # Make a prediction with a decision tree
     def __predict(self, node, row):
         if row[node['index']] < node['value']:
@@ -79,90 +78,101 @@ class DiffableTree:
             else:
                 return node['right']
 
-
     # Fit tree to 'train' data, which contains labels at last column
     def fit(self, train, retrain=False):
-        assert type(train) != list
-        
         if self.root and not retrain:
             raise AssertionError("Tree has already been trained. \
                 If you're sure you want to fit it again, pass 'retrain=True'.")
         
         if not (self.max_depth and self.min_size):
             raise AssertionError("Attributes 'max_depth' and 'min_size' must be set before calling '.fit()'.")
-
-        self.root = self.get_split(train)
-        self.split(self.root, 1)
         
+
+        full_mask = self.xp.ones(train.shape[0], dtype=bool)
+        self.root = DiffableTree.split(self, self.get_split(train, full_mask), 1, train)
+
         # after tree is formed, create fingerprint
-        self.fingerprint = self.generate_fingerprint(train)
+        print("DANGER DANGER, USING GENERIC FINGERPRINT")
+        self.fingerprint = "GENERIC" # self.generate_fingerprint(train)
 
-
-    def get_split(self, dataset):
-        best_index, best_value, best_mse, best_groups = None, None, float('inf'), None
-        for index in range(dataset.shape[1] - 1):
-            for row in dataset:
-                groups = self.test_split(index, row[index], dataset)
-                mse = self.mse_calculator(groups, dataset.shape[0])
-                if mse < best_mse:
-                    best_index, best_value, best_mse, best_groups = index, row[index], mse, groups
-        return {'index': best_index, 'value': best_value, 'groups': best_groups}
-
-    
-    # Split a dataset based on an attribute and an attribute value
-    def test_split(self, index, value, dataset):
-        mask = dataset[:, index] < value
-        return dataset[mask], dataset[~mask]
-
-    
-    def split(self, node, depth):
-        left, right = node.pop('groups')
-
-        # check for a no split
-        if left.size == 0 or right.size == 0:
-            node['left'] = node['right'] = self.to_terminal(self.xp.vstack((left, right)))
-            return
+    def get_split(self, dataset, mask):
+        N, D = dataset[:, :-1].shape
         
-        # check for max depth
+        # Note: we want to try out *every* value for splitting at the current node (n.o. values=N*D)
+        flat_indices = self.xp.repeat(self.xp.arange(D), N)  # shape: (D*N,)
+        flat_values = dataset[:, :-1].T.flatten()  # shape: (D*N,)
+        flat_mask = self.xp.repeat(mask[:, None].T, D, axis=0).flatten()
+
+        def split_and_mse(index, value, mask_val):
+            actual_result = lambda: (
+                self.mse_calculator(*self.test_split(index, value, dataset, mask), dataset[:, -1]),
+                index,
+                value
+            )
+            placeholder_result = lambda: (self.xp.inf, -1, -1.0) # if 'value' is from sample not in current mask
+            return cond(
+                pred=mask_val, 
+                true_fun=actual_result, 
+                false_fun=placeholder_result
+            )
+
+        # TODO: better performance when doing self.xp.where outside split_and_mse()?
+        mses, indices, values = jax.vmap(split_and_mse)(flat_indices, flat_values, flat_mask)
+
+        # Find the best split
+        best_idx = self.xp.argmin(mses)
+        best_index = indices[best_idx]
+        best_value = values[best_idx]
+        best_groups = self.test_split(best_index, best_value, dataset, mask)
+
+        return {
+            'index': best_index,
+            'value': best_value,
+            'groups': best_groups,
+        }
+    
+    def test_split(self, index, value, dataset, mask):
+        # determine splitting masks and apply mask of current dataset subset (logical and)
+        left_mask = dataset[:, index] < value
+        return self.xp.logical_and(left_mask, mask), self.xp.logical_and(~left_mask, mask)
+
+    @staticmethod
+    def split(self, node, depth, dataset):
+        left_mask, right_mask = node['groups']
+        
         if depth >= self.max_depth:
-            node['left'], node['right'] = self.to_terminal(left), self.to_terminal(right)
-            return
-
-        # process left child
-        node['left'] = self.to_terminal(left) if len(left) <= self.min_size else self.get_split(left)
-        if isinstance(node['left'], dict):
-            # not a terminal node, keep processing
-            self.split(node['left'], depth + 1)
-
-        # process right child
-        node['right'] = self.to_terminal(right) if len(right) <= self.min_size else self.get_split(right)
-        if isinstance(node['right'], dict):
-            # not a terminal node, keep processing
-            self.split(node['right'], depth + 1)
+            left_terminal = self.to_terminal(dataset, left_mask)
+            right_terminal = self.to_terminal(dataset, right_mask)
+            return {'left': left_terminal, 'right': right_terminal, 'index': node['index'], 'value': node['value']}
+        
+        if self.xp.sum(left_mask) <= self.min_size:
+            left_node = self.to_terminal(dataset, left_mask)
+        else:
+            left_node = DiffableTree.split(self, self.get_split(dataset, left_mask), depth + 1, dataset)
+        
+        if self.xp.sum(right_mask) <= self.min_size:
+            right_node = self.to_terminal(dataset, right_mask)
+        else:
+            right_node = DiffableTree.split(self, self.get_split(dataset, right_mask), depth + 1, dataset)
+        
+        return {'left': left_node, 'right': right_node, 'index': node['index'], 'value': node['value']}
 
 
     # Create a terminal node value
-    def to_terminal(self, group):
-        if len(group) == 0:
-            raise ValueError("argument 'group' can't be empty!")
-        return self.xp.mean(group[:, -1])
-
-
-    def mse_calculator(self, groups, n_samples):
-        mse_split = 0
-        # calculate mse for both split sides, weighted by respective group size
-        for group in groups:
-            if group.size == 0: continue
-            weighted_mse = mse(group[:, -1], self.to_terminal(group), xp=self.xp) * group.shape[0]
-            mse_split += (weighted_mse) / n_samples
-
-        return mse_split
+    def to_terminal(self, dataset, mask):
+        return diffable_subset_mean(dataset[:, -1], mask)
     
-    
-    # Check whether this tree instance is equal to tree instance 'tree2'
-    def equals(self, tree2):
-        return tree_diff(self, tree2) == 0
+    def mse_calculator(self, left_mask, right_mask, outcomes):
+        def group_loss(mask):
+            # Compute mean outcome of all samples in current group
+            mean_outcome = diffable_subset_mean(outcomes, mask)
+            
+            squared_errors = self.xp.where(mask, (outcomes - mean_outcome)**2, 0.0)
+            weighted_mse = self.xp.sum(squared_errors) # ("weighted" means multiply with group size. Hence mse -> se)
+            return weighted_mse
 
+        res = (group_loss(left_mask) + group_loss(right_mask)) / (self.xp.sum(left_mask) + self.xp.sum(right_mask))
+        return res
     
     # create fingerprint from train params and tree hash
     # trees with different fingerprints may still satisfy the .equals() function
@@ -173,7 +183,6 @@ class DiffableTree:
         tree_hash = smolhash(root_hash + train_hash)
         
         return f"u{self.max_depth}-l{self.min_size}-{tree_hash}"
-
 
     def to_json(self):
         return json.dumps(
@@ -188,18 +197,16 @@ class DiffableTree:
             cls=JaxTracerEncoder
         )
     
-    
     @classmethod
     def from_json(cls, json_str):
         data = json.loads(json_str)
         return cls(**data)
 
 
-import jax.numpy as jnp
-
 def soft_step(x, threshold, steepness=100.0):
     # Approximates the indicator function x < threshold using a sigmoid.
     return jax.nn.sigmoid(steepness * (threshold - x))
+
 
 def diffable_predict(node, sample, steepness=100.0):
     """
@@ -230,84 +237,54 @@ def diffable_predict(node, sample, steepness=100.0):
 # this is done by analyzing the partitions both trees create and superimposing them
 # each (new) cell is then evaluated by picking the sample in its center
 def compute_tree_difference(client_tree, dummy_tree, initial_bounds):
-    # root1 = {
-    #     "index": 0,
-    #     "value": 8,
-    #     "left": 1,
-    #     "right": {
-    #         "index": 0,
-    #         "value": 14,
-    #         "left": {
-    #             "index": 1,
-    #             "value": 50,
-    #             "left": 0,
-    #             "right": {
-    #                 "index": 1,
-    #                 "value": 100,
-    #                 "left": 1,
-    #                 "right": 0
-    #             }   
-    #         },
-    #         "right": 0
-    #     }
-    # }
-    # root2 = {
-    #     "index": 0,
-    #     "value": 5,
-    #     "left": 1,
-    #     "right": 0
-    # }
-    # tree1 = DiffableTree(root=root1)
-    # tree2 = DiffableTree(root=root1)
-    # samples = [
-    #     [7.9, 0],   # 1
-    #     [7.9, 200], # 1
-    #     [5, 54],    # 1
-    #     [10, 49],   # 0
-    #     [10, 51],   # 1
-    #     [10, 101],  # 0
-    #     [10, 2002], # 0
-    #     [15, 10],   # 0
-    #     [15, 55],   # 0
-    #     [15, 150],  # 0
-    #     [15, 500],  # 0
-    #     ]
-    # samples = jnp.array(samples)
-    # predictions = [tree1.predict(sample) for sample in samples]
-    # assert [1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0] == predictions
-    partitions = get_refined_partitions(client_tree, dummy_tree, initial_bounds)
-    partitions = jnp.unique(partitions, axis=0)
+    partitions, mask = get_intersected_partitions(client_tree, dummy_tree, initial_bounds)
+    # partitions = jnp.unique(partitions, axis=0)
     partition_centers = partition_center(partitions)
-    # centers_printable = "\n".join(" / ".join(str(feat_val) for feat_val in center) for center in partition_centers)
-    # print(f"partition_centers ({len(partition_centers)}):", "\n" + centers_printable)
-    # predictions = jnp.array([[client_tree.predict(x), dummy_tree.predict(x)] for x in partition_centers])
-    predictions = jnp.array([[diffable_predict(client_tree.root, x), diffable_predict(dummy_tree.root, x)] for x in partition_centers])
-    return mse(*predictions.T, xp=jnp)
-#4.3757496
-def get_refined_partitions(client_tree, dummy_tree, initial_bounds):
+    
+    fn_squared_errors = jax.vmap(lambda x: (diffable_predict(client_tree.root, x) - diffable_predict(dummy_tree.root, x))**2)
+    squared_errors_2 = fn_squared_errors(partition_centers)
+    mse = jnp.sum(jnp.where(mask, squared_errors_2, 0.0)) / jnp.sum(mask)
+    return mse
+
+
+# Intersects each partition of the client tree with all partitions of the dummy tree
+# a partition (shape=(8,2)) is an 8-D hyperrectangel. One tuple (lower, upper) for each dimension
+def get_intersected_partitions(client_tree, dummy_tree, initial_bounds):
     client_partitions = jnp.array(extract_partitions(client_tree, initial_bounds))
     dummy_partitions = jnp.array(extract_partitions(dummy_tree, initial_bounds))
-    
-    # exit()
+
     client_partitions = jnp.unique(client_partitions, axis=0)
     dummy_partitions = jnp.unique(dummy_partitions, axis=0)
 
-    refined_regions = []
-    for cr in client_partitions:
-        for dr in dummy_partitions:
-            region = intersect_regions(cr, dr)
-            if region is not None:
-                refined_regions.append(region)
-    return jnp.array(refined_regions)
+    # Compute the cartesian product indices
+    num_cp = client_partitions.shape[0]
+    num_dp = dummy_partitions.shape[0]
+    
+    # Create all index pairs (i,j)
+    cp_idx, dp_idx = jnp.meshgrid(jnp.arange(num_cp), jnp.arange(num_dp), indexing='ij')
+    cp_idx = cp_idx.flatten()
+    dp_idx = dp_idx.flatten()
+
+    # Extract all pairs
+    cp_flat = client_partitions[cp_idx]
+    dp_flat = dummy_partitions[dp_idx]
+
+    # Vectorize the intersection function over these pairs
+    intersections, mask = jax.vmap(intersect_partitions)(cp_flat, dp_flat)
+
+    return intersections, mask
 
 
-def intersect_regions(r1, r2):
+def intersect_partitions(r1, r2):
     """Compute intersection of two axis-aligned hyperrectangles."""
     lower = jnp.maximum(r1[:, 0], r2[:, 0])
     upper = jnp.minimum(r1[:, 1], r2[:, 1])
-    if jnp.any(lower >= upper):
-        return None  # Empty intersection
-    return jnp.stack([lower, upper], axis=-1)
+    
+    is_not_empty = jnp.all(lower < upper)
+    intersection = jnp.stack([lower, upper], axis=-1)
+    
+    return intersection, is_not_empty
+
 
 def extract_partitions(tree, initial_bounds):
     """
@@ -343,85 +320,3 @@ def extract_partitions(tree, initial_bounds):
 def partition_center(arr):
     assert 2 <= arr.ndim <= 3 # only allow single cell or array of cells
     return jnp.mean(arr, axis=arr.ndim-1)
-    
-
-def count_features(node):
-    if node is None:
-        return 0
-    if isinstance(node, dict):
-        return max(
-            node['index'] + 1,
-            count_features(node.get('left')),
-            count_features(node.get('right')),
-        )
-    return 0
-
-
-
-
-
-# --- Extract Splitting Boundaries from a Tree ---
-def extract_boundaries(node, feature_index, boundaries=None):
-    if boundaries is None:
-        boundaries = []
-    if isinstance(node, dict):
-        if node['index'] == feature_index:
-            boundaries.append(node['value'])
-        # Recursively extract from left and right.
-        extract_boundaries(node['left'], feature_index, boundaries)
-        extract_boundaries(node['right'], feature_index, boundaries)
-    return boundaries
-
-
-
-# computes diff between two trees by summed squared distance of indexes/thresholds.
-# Different structure (leaf vs non-leaf) inflicts instant 'VERY_LARGE_NUMBER' damage
-# @param level: level in the tree hierachy (root node=0), so we know when to sum up. Could replace by always summing up. TODO!
-# TODO: remove dependence on same random seed during training
-def tree_diff(tree1, tree2, level=0):#client_test, level=0):
-    # preds_1 = [tree1.predict(sample) for sample in client_test]
-    # preds_2 = [tree2.predict(sample) for sample in client_test]
-
-    # print(preds_1, "\n", preds_2)
-    # print(np.sum(np.array(preds_1) - np.array(preds_2)))
-    # exit()
-
-    # extract tree structure (dict) from instance
-    if isinstance(tree1, DiffableTree): tree1 = tree1.root
-    if isinstance(tree2, DiffableTree): tree2 = tree2.root
-    
-    # list of errors to be summed up with jnp.sum(). Could probably use +=, but I'll check that later
-    errors = []
-    # Here, v1/v2 are values of fields "index", "value", "left", "right"
-    for v1, v2 in zip(tree1.values(), tree2.values()):
-        # this indicates, that one tree has a leaf node, while the other has not
-        if not same_type(v1, v2):
-            errors.append(VERY_LARGE_NUMBER * (1/(level+1)))
-            
-            if type(v1) == dict:
-                # replace v2 by dummy tree to resume traversing v1
-                v2 = dict(enumerate([None] * 4)) # dummy tree
-            else:
-                # replace v2 with v1, so the error will be 0, since we already added the VERY_LARGE_NUMBER penalty
-                v2 = v1
-
-        if isinstance(v1, dict): # calculate difference for the subtree
-            errors.extend(tree_diff(v1, v2, level=level+1))
-        elif isinstance(v1, int): # calculate difference for index selection
-            errors.append(int(v1 != v2) * VERY_LARGE_NUMBER * (1/(level+1))) # Note: For high feature counts, this could cause overshoots
-        elif isinstance(v1, float):
-            errors.append(jax.numpy.pow(v1-v2, 2))
-    
-    # return sum of aggregated errors
-    return jax.numpy.sum(jax.numpy.array(errors)) if level == 0 else errors
-
-    
-# DANGEROUS: expects only 'b' to ever be traced by JAX
-def same_type(a, b):
-    # Check if a, b have same type or, if not and b is wrapped 
-    # in a Tracer object, if a and b's wrapped variable have same type
-    if (isinstance(b, jax._src.interpreters.ad.JVPTracer)):
-        if isinstance(a, dict): return False
-        if isinstance(a, (numpy.floating, numpy.ndarray)): return type(a.item()) == type(b.primal.item())
-        
-    return type(a) == type(b)
