@@ -1,105 +1,232 @@
+import json
+import jax.numpy as jnp
+import jax
+from jax.lax import cond
 import numpy as np
-from random import randrange
-import typing
+import random
 from dataclasses import dataclass
+from differentiable import diffable_predict
+from jax.interpreters.ad import JVPTracer
+
+_feature_bounds = None
+random.seed(1)
+
+
+disable_jax = False
+
+class TreeEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, JVPTracer):
+            return o.primal
+        elif (isinstance(o, (jax.numpy.ndarray, np.ndarray)) and o.size == 1) or isinstance(o, jnp.float32):
+            return o.item()
+        elif isinstance(o, jnp.int8):
+            return o.item()
+        elif isinstance(o, jnp.ndarray):
+            return str(o)
+        else:
+            print(type(o), o)
+            return o
+
+
+if disable_jax:
+    def non_diffable_cond(pred, true_fun, false_fun, *operand):
+        if pred:
+            return true_fun(*operand)
+        else:
+            return false_fun(*operand)
+
+    cond = non_diffable_cond
+    jnp = np
 
 
 @dataclass
 class SplitInfo:
-    index: np.int8
-    value: np.float32
-    left_mask: np.ndarray
-    right_mask: np.ndarray
+    index: jax.Array
+    value: jax.Array
+    left_mask: jnp.ndarray
+    right_mask: jnp.ndarray
     
     def __post_init__(self):        
-        assert isinstance(self.index, np.int8), "TypeError for field 'index'"
-        assert isinstance(self.value, np.float32), "TypeError for field 'value'"
-        assert isinstance(self.left_mask, np.ndarray) and self.left_mask.dtype==bool , "TypeError for field 'left_mask'"
-        assert isinstance(self.right_mask, np.ndarray) and self.right_mask.dtype==bool , "TypeError for field 'right_mask'"
+        assert isinstance(self.index, jax.Array if not disable_jax else object), "TypeError for field 'index'"
+        assert isinstance(self.value, jax.Array if not disable_jax else object), "TypeError for field 'value'"
+        assert isinstance(self.left_mask, jnp.ndarray) and self.left_mask.dtype==bool , "TypeError for field 'left_mask'"
+        assert isinstance(self.right_mask, jnp.ndarray) and self.right_mask.dtype==bool , "TypeError for field 'right_mask'"
+        
+        # self.is_empty_split = self.left_mask.any() and self.right_mask.any()
 
-        left_size = np.sum(self.left_mask)
-        right_size = np.sum(self.right_mask)
-        self.is_pseudo_split = left_size == 0 or right_size == 0
+def mse(y_true, y_pred):
+    return jnp.mean((y_true - y_pred) ** 2)
 
-# random.seed(1)
+def mae(y_true, y_pred):
+    return jnp.mean(jnp.abs(y_true - y_pred))
 
-__feature_bounds = None
+def test_tree(tree, data, y_train):
+    X, y = data[:, :-1], data[:, -1]
+
+    # predictions = predict(tree, X)
+    predictions = jnp.array([diffable_predict(tree, sample, y_train) for sample in X])
+    return {
+        'mse': mse(y, predictions),
+        'mae': mae(y, predictions),
+        'predictions': predictions
+    }
 
 
-def cond(pred, true_fun, false_fun):
-  if pred:
-    return true_fun()
-  else:
-    return false_fun()
+def predict(root, X, y_train):
+        if X.ndim == 1:
+            return __predict(root, X, y_train)
+        elif X.ndim == 2:
+            return jnp.array([__predict(root, sample, y_train) for sample in X])
 
 
-def train_tree(train, max_depth=None, min_size=None, feature_bounds=None):
-    global __feature_bounds
-    __feature_bounds = feature_bounds
+def __predict(node, sample, y_train):
+    if is_leaf(node):
+        return to_leaf(node, y_train)
+    else:
+        decision = 'left' if sample[node['index']] < node['value'] else 'right'
+        return __predict(node[decision], sample, y_train)
     
-    def too_small(_node):
-        return np.sum(_node['subset_mask']) <= min_size
+def to_leaf(node, y_train):
+    return diffable_subset_mean(y_train, node['subset_mask'])
+
+
+def make_process_node_fn(train, max_depth, min_size, find_best_split, diffable_subset_mean):
+    identity = lambda x, *_: x
     
-    root = {'subset_mask': np.ones(train.shape[0], dtype=bool)}
-    raw_nodes = [root]
-    for depth in range(0, max_depth+1):
-        new_raw_nodes = [] # raw nodes for next iteration
+    # --- all of these are pure JAX functions ---
+    def split_node(node):
+        info = find_best_split(node['subset_mask'], train)
+        return {
+            'subset_mask': node['subset_mask'],
+            'index':       info.index,
+            'value':       info.value,
+            'left':        {'subset_mask': info.left_mask},
+            'right':       {'subset_mask': info.right_mask},
+        }
+        
+    def undo_split(node):
+        return {
+            'subset_mask': node['subset_mask'],
+            'index':       jnp.int8(-1),
+            'value':       jnp.float32(-1),
+            'left':        node['left'],
+            'right':       node['right']
+        }
+        
+    def is_split_allowed(node, depth):
+        return (node['subset_mask'].sum() > min_size) & (depth < max_depth)
 
-        # iterate over all nodes in current level/depth and split/leafify them
-        for node in raw_nodes:
-            if too_small(node) or depth == max_depth:
-                to_leaf(node, train[:, -1])
-            else:
-                child_nodes = split(node, train, return_childs=True)
-                new_raw_nodes.extend(child_nodes)
+    def equal_leafs(left, right):
+        return to_leaf(left, train[:, -1]) == to_leaf(right, train[:, -1])
 
-        # update raw_nodes for next iteration
-        raw_nodes = new_raw_nodes
+    def is_empty_split(node):
+        lm, rm = node['left']['subset_mask'], node['right']['subset_mask']
+        return ~(lm.any() & rm.any())
 
+
+    def process_node(node, depth):
+        # 1) split
+        node2 = split_node(node)
+
+        # 2) two cases: empty split → immediate leaf, else → examine children
+        def on_empty(n):
+            return n, False, False, True
+
+        def on_not_empty(n):
+            left, right = n['left'], n['right']
+
+            # 3) decide for each child whether it stays raw (queue) or becomes a leaf
+            ok_l = is_split_allowed(left, depth + 1)
+            ok_r = is_split_allowed(right, depth + 1)
+            
+            # 5) maybe collapse into a single leaf if both children agree
+            should_collapse = jnp.logical_and(jnp.logical_not(jnp.logical_or(ok_l, ok_r)), equal_leafs(left, right))
+
+            return cond(should_collapse,
+                        lambda: (n, ok_l, ok_r, True),
+                        lambda: (n, ok_l, ok_r, False))
+
+        return cond(is_empty_split(node2),
+                    on_empty, on_not_empty,
+                    node2)
+
+    return process_node
+
+def train_tree(train, max_depth, min_size):
+    def set_in(tree, path, new_sub):
+        if not path:
+            return new_sub
+        head, *tail = path
+        child = tree[head]
+        updated = set_in(child, tail, new_sub)
+        return { **tree, head: updated }
+
+    append_to_list = lambda l, item: l + [item]
+    process_node = make_process_node_fn(train, max_depth, min_size,
+                                    find_best_split, diffable_subset_mean)
+
+    root = {'subset_mask': jnp.ones(train.shape[0], dtype=bool)}
+    raw_nodes = [ ((), root) ]
+
+    for depth in range(max_depth):
+        new_queue = []
+        for path, node in raw_nodes:
+            # run all splitting + leaf‐logic in one JAX call
+            node_out, left_ok, right_ok, should_collapse = process_node(node, depth)
+            
+            if should_collapse:
+                node_out = {
+                    'subset_mask': node_out['subset_mask'],
+                    'index':       jnp.int8(-1),
+                    'value':       jnp.float32(-1),
+                    'left':        node_out['left'],
+                    'right':       node_out['right']
+                }
+                
+            root = set_in(root, path, node_out)
+            
+            # 2) update host‐side queue normally
+            if bool(left_ok):
+                new_queue.append((path + ('left',), node_out['left']))
+            if bool(right_ok):
+                new_queue.append((path + ('right',), node_out['right']))
+
+        raw_nodes = new_queue
+
+    # print(json.dumps(root, indent=2, cls=TreeEncoder))
+    # print(train[:, -1])
+    # exit()
     return root
 
 
-
-def split(node, train, return_childs=False):
-    child_nodes = []
-    subset_mask = node['subset_mask']
-    split_info = find_best_split(subset_mask, train)
-    
-    if split_info.is_pseudo_split:
-        to_leaf(node, train[:, -1])
-    else:
-        del node['subset_mask']
-        node['index'] = split_info.index
-        node['value'] = split_info.value
-        node['left'] = {'subset_mask': split_info.left_mask}    
-        node['right'] = {'subset_mask': split_info.right_mask}
-        child_nodes = [node['left'], node['right']]
-    
-    if return_childs:
-        return child_nodes
-
-
-def to_leaf(node, outcomes):
-    # delete subset_mask key and add prediction
-    mean_outcome = diffable_subset_mean(outcomes, node.pop('subset_mask'))
-    node['prediction'] = mean_outcome
+def is_leaf(node):
+    return len(node) == 1
 
 
 def diffable_subset_mean(arr, subset_mask):
-    if np.sum(subset_mask) == 0:
-        return 0
-    
-    mean = np.sum(np.where(subset_mask, arr, 0.0)) / (np.sum(subset_mask))
+    mean = jnp.sum(jnp.where(subset_mask, arr, 0.0)) / (jnp.sum(subset_mask) + 1e-14)
     return mean
 
 
 def find_best_split(mask, train):
+    # feature_index = randrange(train.shape[1] - 1)
+    # number = _feature_bounds[feature_index]
+    # split_value = jnp.random.uniform(*number)
+    # left_mask, right_mask = test_split(feature_index, split_value, mask, train)
+    # return SplitInfo(
+    #     index=jnp.int8(feature_index),
+    #     value=jnp.float32(split_value),
+    #     left_mask=left_mask,
+    #     right_mask=right_mask
+    # )
+    
     N, D = train[:, :-1].shape
     
     # Note: we want to try out *every* value for splitting at the current node (n.o. values=N*D)
-    flat_indices = np.repeat(np.arange(D), N)  # shape: (D*N,)
+    flat_indices = jnp.repeat(jnp.arange(D), N)  # shape: (D*N,)
     flat_values = train[:, :-1].T.flatten()  # shape: (D*N,)
-    flat_mask = np.repeat(mask[:, None].T, D, axis=0).flatten()
+    flat_mask = jnp.repeat(mask[:, None].T, D, axis=0).flatten()
 
     def split_and_mse(index, value, mask_val):
         actual_result = lambda: (
@@ -107,81 +234,46 @@ def find_best_split(mask, train):
             index,
             value
         )
-        placeholder_result = lambda: (np.inf, -1, -1.0) # if 'value' is from sample not in current mask
+        placeholder_result = lambda: (jnp.inf, -1, -1.0) # if 'value' is from sample not in current mask
         return cond(
             pred=mask_val, 
             true_fun=actual_result, 
             false_fun=placeholder_result
-        )
-
-    lowest_mse = np.inf
-    b_i = None
-    b_v = None
-    group = train[mask]
-    for sample in group:
-        for _i, _v in enumerate(sample[:-1]):
-            new_mask = group[:, _i] < _v
-            left = group[new_mask]
-            right = group[~new_mask]
-            mse = mse_calculator_nondiff(left, right)
-            if mse<lowest_mse:
-                lowest_mse = mse
-                b_i = _i
-                b_v = _v
-                
-    left_mask, right_mask = test_split(b_i, b_v, mask, train)
-    
-    return SplitInfo(
-        index=np.int8(b_i),
-        value=np.float32(b_v),
-        left_mask=left_mask,
-        right_mask=right_mask
-    )
+        )   
         
     # mses, indices, values = jax.vmap(split_and_mse)(flat_indices, flat_values, flat_mask)
-    mses, indices, values = np.array([split_and_mse(i, v, m) for i, v, m in zip(flat_indices, flat_values, flat_mask)]).T
-    indices = indices.astype(np.int16)
+    mses, indices, values = jnp.array([split_and_mse(i, v, m) for i, v, m in zip(flat_indices, flat_values, flat_mask)]).T
+    indices = indices.astype(jnp.int16)
+   
     # Find the best split
-    best_idx = np.argmin(mses)
+    best_idx = jnp.argmin(mses)
     best_index = indices[best_idx]
     best_value = values[best_idx]
     
-    return best_index, best_value, test_split(best_index, best_value, mask, train)
+    left_mask, right_mask = test_split(best_index, best_value, mask, train)#
+    split_info = SplitInfo(
+        index=jnp.int8(best_index),
+        value=jnp.float32(best_value),
+        left_mask=left_mask,
+        right_mask=right_mask
+    )
+    
+    return split_info
 
 
-def mse_calculator_nondiff(left, right) :
-        def mse(samples) :
-            outcomes = samples[:, -1]
-            if len(outcomes) == 0:
-                return 0
-            
-            mean_out = np.sum(outcomes) / len(outcomes)
-            return np.sum((outcomes - mean_out) ** 2) / len(outcomes)
-        
-        left_mse = mse(left)
-        right_mse = mse(right)
-        #This represents the MSE of the split
-        mse_split = (left_mse * len(left) + right_mse * len(right)) / (len(left) + len(right))
-
-        return mse_split
-
-
-def mse_calculator(left_mask, right_mask, outcomes):
+def mse_calculator(left_mask, right_mask, y_train):
     def group_loss(mask):
-        if np.sum(mask) == 0:
-            return 0
         # Compute mean outcome of all samples in current group
-        mean_outcome = diffable_subset_mean(outcomes, mask)
-        
-        squared_errors = np.where(mask, (outcomes - mean_outcome)**2, 0.0)
-        weighted_mse = np.sum(squared_errors) # ("weighted" means multiply with group size. Hence mse -> se)
+        mean_outcome = diffable_subset_mean(y_train, mask)
+        squared_errors = jnp.where(mask, (y_train - mean_outcome)**2, 0.0)
+        weighted_mse = jnp.sum(squared_errors) # ("weighted" means multiply with group size. Hence mse -> se)
         return weighted_mse
 
-    mse_split = (group_loss(left_mask) + group_loss(right_mask)) / (np.sum(left_mask) + np.sum(right_mask))
+    mse_split = (group_loss(left_mask) + group_loss(right_mask)) / (jnp.sum(left_mask) + jnp.sum(right_mask) + 1e-14)
     return mse_split
 
 
 def test_split(index, value, mask, train):
     # determine splitting masks and apply mask of current train subset (logical and)
     global_left_mask = train[:, index] < value
-    return np.logical_and(global_left_mask, mask), np.logical_and(~global_left_mask, mask)
+    return jnp.logical_and(global_left_mask, mask), jnp.logical_and(~global_left_mask, mask)

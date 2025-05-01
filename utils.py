@@ -1,19 +1,30 @@
 import json
-import jax.numpy as jnp
 import numpy as np
 import graphviz
 from hashlib import md5
-
-import differentiable
+from pathlib import Path
+import regression
 
 
 AUTOREPLY = None
 
 
-def ask_yes_no(prompt):
-    user_input =  AUTOREPLY if AUTOREPLY else input(prompt + " [y/N]: ")
+def ask_yes_no(prompt, force=False):
+    user_input =  AUTOREPLY if AUTOREPLY and not force else input(prompt + " [y/N]: ")
     return user_input.lower() == 'y'
     
+
+def get_feature_bounds(dataset, has_labels=True, extend_int_bounds=True):
+    # extract features if dataset contains labels in last column
+    features = dataset[:, :-1] if has_labels else dataset
+    bounds = np.column_stack((features.min(axis=0), features.max(axis=0)))
+    # extend upper bound for 'Sex' (0,1,2). Prevents empty intersection for cell/leaf 2.0
+    if extend_int_bounds:
+        mask = np.all(features % 1 == 0, axis=0)
+        bounds[mask, 1] += 0.01
+    
+    return bounds
+
 # not a secure hash function. only use for fingerprints/filenames
 # returns the first 7 chars form the hexencoded md5 hash of 'something'
 def smolhash(something):
@@ -23,12 +34,10 @@ def smolhash(something):
         something = str(something).encode('utf-8')
     elif isinstance(something, np.ndarray):
         something = something.data.tobytes()
-    elif isinstance(something, jnp.ndarray):
-        something = np.array(something).data.tobytes()
-    elif isinstance(something, differentiable.DiffableTree):
-        something = json.dumps(something.root, cls=differentiable.JaxTracerEncoder).encode('utf-8')
+    elif isinstance(something, regression.RegressionTree):
+        something = json.dumps(something.root).encode('utf-8')
     elif not isinstance(something, bytes):
-        raise TypeError("Argument 'something' must be str, int, float, bytes, numpy.ndarray, jax.numpy.ndarray or differentiable.DiffableTree")
+        raise TypeError("Argument 'something' must be str, int, float, bytes, numpy.ndarray, or regression.RegressionTree")
     
     return md5(something).hexdigest()[:7]
 
@@ -45,10 +54,10 @@ def get_ok_to_write_file(fp, create_dir=False, ignore_exist=False):
 def load_client_state(state_dir):
     # load client tree (json) and train dataset (npy)
     tree_data=(state_dir / "client_tree.json").read_text()
-    client_tree = differentiable.DiffableTree.from_json(tree_data)
-    client_train = np.load((state_dir / "client_train.npy")).astype(np.float32)
+    client_tree = regression.RegressionTree.from_json(tree_data)
+    client_train = np.load((state_dir / "client_train.npy"))
 
-    # Build DiffableTree instance from tree dict and return client dataset, tree
+    # Build RegressionTree instance from tree dict and return client dataset, tree
     return client_train, client_tree
 
 def save_client_state(state_dir, client_train, client_tree):
@@ -62,7 +71,7 @@ def save_client_state(state_dir, client_train, client_tree):
     
     # save train data as npy, if file doesn't exist or user doesn't care
     if get_ok_to_write_file(fp_client_train):
-        jnp.save(fp_client_train, client_train)
+        np.save(fp_client_train, client_train)
 
 def load_dummy_state(state_dir):
     # load dummy tree (json) and attack sample (npy)
@@ -73,12 +82,12 @@ def load_dummy_state(state_dir):
     
     if fp_tree.exists():
         tree_data = (state_dir / "dummy_tree.json").read_text()
-        dummy_tree = differentiable.DiffableTree.from_json(tree_data)
+        dummy_tree = regression.RegressionTree.from_json(tree_data)
     
     if fp_sample.exists():
-        dummy_sample = jnp.load(fp_sample).astype(np.float32)
+        dummy_sample = np.load(fp_sample)
     
-    # Build DiffableTree instance from tree dict and return dummy sample, tree
+    # Build RegressionTree instance from tree dict and return dummy sample, tree
     return dummy_sample, dummy_tree
 
 def save_dummy_state(state_dir, dummy_sample=None, dummy_tree=None, ignore_conflicts=False):
@@ -86,7 +95,7 @@ def save_dummy_state(state_dir, dummy_sample=None, dummy_tree=None, ignore_confl
     if dummy_sample != None:
         fp_dummy_sample = state_dir / "dummy_sample.npy"
         if get_ok_to_write_file(fp_dummy_sample, create_dir=ignore_conflicts, ignore_exist=ignore_conflicts):
-            jnp.save(fp_dummy_sample, dummy_sample)
+            np.save(fp_dummy_sample, dummy_sample)
     
     if dummy_tree != None:
         fp_dummy_tree = state_dir / "dummy_tree.json"
@@ -98,8 +107,14 @@ def visualize_tree(tree1, tree2=None, labels=("Client Tree", "Dummy Tree"), fp_o
     if tree1 == tree2 == None:
         raise ValueError("Need at least one tree to plot but tree1 and tree2 are None.")
     
-    if isinstance(tree1, differentiable.DiffableTree): tree1 = tree1.root 
-    if isinstance(tree2, differentiable.DiffableTree): tree2 = tree2.root 
+    if not fp_out:
+        if ask_yes_no("Visualize tree: Missing fp_out. Use default? (./debuganalysis)", force=True):
+            fp_out = Path("debuganalysis")
+        else:
+            return
+    
+    if isinstance(tree1, regression.RegressionTree): tree1 = tree1.root 
+    if isinstance(tree2, regression.RegressionTree): tree2 = tree2.root 
     
     dot = graphviz.Digraph()
     node_id_counter = [0]  # mutable counter for unique node IDs
@@ -109,7 +124,9 @@ def visualize_tree(tree1, tree2=None, labels=("Client Tree", "Dummy Tree"), fp_o
         node_id = str(node_id_counter[0])
         node_id_counter[0] += 1
 
-        label = f"feature: {tree['index']}\n{tree['value']}"
+        if 'index' not in list(tree.keys()):
+            print(tree)
+        label = f"feature: {tree['index']}\n{tree['value']:.3f}"
         subgraph.node(node_id, label=label)
 
         if parent_id is not None:
@@ -117,12 +134,14 @@ def visualize_tree(tree1, tree2=None, labels=("Client Tree", "Dummy Tree"), fp_o
 
         for side in ("left", "right"):
             child = tree[side]
-            if isinstance(child, dict):
+            is_leaf = not isinstance(child, dict) or (isinstance(child, dict) and "prediction" in child)
+            if not is_leaf:
                 add_node(child, parent_id=node_id, edge_label=side, subgraph=subgraph)
             else:
                 leaf_id = str(node_id_counter[0])
                 node_id_counter[0] += 1
-                subgraph.node(leaf_id, label=str(child), shape="box")
+                child_label = f"{child['prediction']:.3f}" if isinstance(child, dict) else str(child)
+                subgraph.node(leaf_id, label=child_label, shape="box")
                 subgraph.edge(node_id, leaf_id, label=side)
 
     # Create a subgraph for the first tree
