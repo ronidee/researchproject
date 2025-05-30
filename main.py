@@ -69,7 +69,7 @@ def init_client(args):
             min_size=args.min_size,
         )
         
-        metrics = iteratively.test_tree(client_tree, client_test, client_train[:, -1])
+        metrics = iteratively.test_tree(client_tree, client_test)
     
         print(f"Built new client_tree (mse: {metrics['mse']:.3f}, mae: {metrics['mae']:.3f})")
         
@@ -237,6 +237,7 @@ def init_dummy(client_train):
     # generate random sample within retrieved feature bounds
     random_features = np.random.uniform(low=feature_min, high=feature_max)
     random_label = np.random.choice([4, 18])
+    # print("WARNING: replacing random label with target label!")
     random_data_point = np.append(random_features, random_label)
     
     return np.array(random_data_point)
@@ -275,8 +276,11 @@ def reconstruct_sample(args):
     optimizer = optax.adam(args.learning_rate)
     opt_state = optimizer.init(dummy_sample)
     
+    np.set_printoptions(linewidth=np.inf)
+    dummy_iterations = []
+
     # attack_state_dir = Path("out/") / client_tree.fingerprint / f"target-{args.target_index}"
-    for i in range(500):
+    for i in range(10):
         # tree_snapshot_dir = attack_state_dir / str(i) # based on previous dummy_sample
         # sample_snapshot_dir = attack_state_dir / str(i+1) # +1, since random is "/0/"
         
@@ -286,15 +290,16 @@ def reconstruct_sample(args):
         if not grad_diff.any():
             print("Attack completed!")
             break
-        
-        print("grad_diff:", grad_diff)
+
         # update dummy_sample using adam optimizer
         updates, opt_state = optimizer.update(grad_diff, opt_state)
-        print("updates:", updates)
         updates = optax.apply_updates(dummy_sample, updates)
         dummy_sample = updates
-
-
+        dummy_iterations.append(dummy_sample.copy())
+    
+    for sample in dummy_iterations:
+        print("target index:", client_train[args.target_index])
+        print("dummy sample:", sample, "\n")
 
 def parse_arguments():
     parser = argparse.ArgumentParser()

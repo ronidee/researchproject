@@ -4,6 +4,7 @@ import jax
 import iteratively
 
 def compute_tree_difference(client_tree, dummy_tree, client_y, dummy_y, initial_bounds):
+    print("WARNING: NOT USING PARTITION SIZE AS WEIGHT YET")
     partitions, mask = get_intersected_partitions(client_tree, dummy_tree, initial_bounds)
     # partitions = jnp.unique(partitions, axis=0)
     partition_centers = jnp.array([partition_center(partition) for partition in partitions])
@@ -68,7 +69,7 @@ def extract_partitions(tree, initial_bounds):
             yield from recurse(node['right'], right_bounds)
         else:
             yield right_bounds
-
+    
     return list(recurse(tree, initial_bounds))
 
 def intersect_partitions(r1, r2):
