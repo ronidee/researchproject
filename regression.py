@@ -14,22 +14,23 @@ def mae(actual, predicted):
     return np.mean(np.abs(actual - predicted))
 
 
-def test_tree(tree, data):
-    predictions = tree.predict(data[:, :-1])
+def test_tree(tree, test_data):
+    predictions = tree.predict(test_data[:, :-1])
     
     return {
-        'mse': mse(data[:, -1], predictions),
-        'mae': mae(data[:, -1], predictions),
+        'mse': mse(test_data[:, -1], predictions),
+        'mae': mae(test_data[:, -1], predictions),
         'predictions': predictions
     }
 
 
+# based on the fantastic implementation from Maha Chakir at https://medium.com/@mahachakir/exploring-regression-trees-building-from-scratch-in-python-9d25dd0dc6ca
 class RegressionTree:
-    def __init__(self, max_depth=None, min_size=None, root=None, trace=True, fingerprint=None):
+    def __init__(self, max_depth=None, min_size=None, root=None, fingerprint=None):
         self.max_depth = max_depth
         self.min_size = min_size
         self.root = root
-        self.trace = trace # unsed atm
+        self.final_depth = 0
 
         if root:
             assert fingerprint # loading trained tree requires original fingerprint
@@ -58,7 +59,6 @@ class RegressionTree:
 
     # Fit tree to 'train' data, which contains labels at last column
     def fit(self, train, retrain=False):
-        random.seed(1)
         if self.root and not retrain:
             raise AssertionError("Tree has already been trained. " \
                 "If you're sure you want to fit it again, pass 'retrain=True'.")
@@ -71,36 +71,16 @@ class RegressionTree:
         self.split(self.root, 1)
 
         # after tree is formed, create fingerprint
-        self.fingerprint = "GENERIC" #self.generate_fingerprint(train)
+        self.fingerprint = self.generate_fingerprint(train)
     
     # split samples based on random feature and value
     def get_split(self, samples):
         # We use random split points, to get different trees using the same data
-        # This is used in DP tree algorithms. The deterministic scenario is subject for future work
-        # feature_index = randrange(samples.shape[1] - 1)
-        # split_value = np.random.uniform(*self.feature_bounds[feature_index])
-        # groups = self.test_split(feature_index, split_value, samples)
+        feature_index = randrange(samples.shape[1] - 1)
+        split_value = np.random.uniform(*self.feature_bounds[feature_index])
+        groups = self.test_split(feature_index, split_value, samples)
         
-        best_mse = np.inf
-        best_index = None
-        best_value = None
-        best_groups = None
-        
-        # for sample in samples:
-        #     for index, value in enumerate(sample[:-1]):
-        for index in range(samples.shape[1]-1):
-            for value in samples[:, index]:
-                new_mask = samples[:, index] < value
-                left = samples[new_mask]
-                right = samples[~new_mask]
-                mse = self.mse_calculator(left, right)
-                if mse<best_mse:
-                    best_mse = mse
-                    best_index = index
-                    best_value = value
-                    best_groups = (left, right)
-        
-        return {'index': best_index,'value': best_value, 'groups': best_groups}
+        return {'index': feature_index,'value': split_value, 'groups': groups}
     
     
     def mse_calculator(self, left, right) :
@@ -120,43 +100,45 @@ class RegressionTree:
         return mse_split
     
     # Split a dataset based on an attribute and an attribute value
-    def test_split(self, index, value, dataset):
-        mask = dataset[:, index] < value
-        return dataset[mask], dataset[~mask]
+    def test_split(self, index, value, samples):
+        mask = samples[:, index] < value
+        return samples[mask], samples[~mask]
 
     # recursively split a node (until max depth or min size is reached)
     def split(self, node, depth):
+        if depth > self.final_depth: self.final_depth = depth
+        
         left, right = node.pop('groups')
 
         # check for max depth
         if depth >= self.max_depth:
-            node['left'], node['right'] = self.to_terminal(left), self.to_terminal(right)
+            node['left'], node['right'] = self.to_leaf(left), self.to_leaf(right)
             return
 
         # process left child
-        node['left'] = self.to_terminal(left) if len(left) <= self.min_size else self.get_split(left)
+        node['left'] = self.to_leaf(left) if left.shape[0] <= self.min_size else self.get_split(left)
         if isinstance(node['left'], dict):
             groups = node['left']['groups']
             if groups[0].size == 0 or groups[1].size == 0:
                 # detect a pseudo-split and prevent duplicate leaf nodes
-                node['left'] = self.to_terminal(np.vstack(groups))
+                node['left'] = self.to_leaf(np.vstack(groups))
             else:
-                # not a terminal node, not a pseudo-split: keep processing
+                # not a leaf node, not a pseudo-split: keep processing
                 self.split(node['left'], depth + 1)
 
         # process right child
-        node['right'] = self.to_terminal(right) if len(right) <= self.min_size else self.get_split(right)
+        node['right'] = self.to_leaf(right) if right.shape[0] <= self.min_size else self.get_split(right)
         if isinstance(node['right'], dict):
             groups = node['right']['groups']
             if groups[0].size == 0 or groups[1].size == 0:
                 # detect a pseudo-split and prevent duplicate leaf nodes
-                node['right'] = self.to_terminal(np.vstack(groups))
+                node['right'] = self.to_leaf(np.vstack(groups))
             else:
-                # not a terminal node, not a pseudo-split: keep processing
+                # not a leaf node, not a pseudo-split: keep processing
                 self.split(node['right'], depth + 1)
 
     # compute leaf value using labels of given samples (mean)
-    def to_terminal(self, samples):
+    def to_leaf(self, samples):
         return np.mean(samples[:, -1])
 
 
@@ -176,7 +158,6 @@ class RegressionTree:
                 "root": self.root,
                 "max_depth": self.max_depth,
                 "min_size": self.min_size,
-                "trace": self.trace,
                 "fingerprint": self.fingerprint
             },
             indent=2

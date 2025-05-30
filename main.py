@@ -1,21 +1,16 @@
-from time import perf_counter
-import optax
 import argparse
+from ast import arg
+from matplotlib.pyplot import step
 import numpy as np
 import pandas as pd
-import jax
-import jax.numpy as jnp
 
 from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
 from pathlib import Path
 from sklearn.preprocessing import LabelEncoder
-
-import iteratively
+import regression
 import utils
-from differentiable import compute_tree_difference
-
-np.random.seed(2)
+import visualization
 
 
 ABALONE_PATH = "dataset/abalone/abalone.data"
@@ -28,7 +23,7 @@ def load_dataset(dataset):
         # the encoder seems to produce this mapping: (F,I,M) -> (0,1,2)
         data_abalone[:, 0] = encoder.fit_transform(data_abalone[:, 0])
         
-        return data_abalone.astype(np.float32)
+        return data_abalone.astype(np.float64)
     else:
         raise ValueError("Argument 'dataset' must be 'abalone'. Argparse should've enforced this.")
 
@@ -64,15 +59,12 @@ def init_client(args):
     else:
         # Create "original" client dataset and tree update
         client_train, client_test = train_test_split(dataset, train_size=args.n_train, test_size=args.n_test, random_state=args.rand_state)
-        client_tree = iteratively.train_tree(
-            client_train,
-            max_depth=args.max_depth,
-            min_size=args.min_size,
-        )
+        client_tree = regression.RegressionTree(max_depth=args.max_depth, min_size=args.min_size)
+        client_tree.fit(client_train)
         
-        metrics = iteratively.test_tree(client_tree, client_test)
+        metrics = regression.test_tree(client_tree, client_test)
     
-        print(f"Built new client_tree (mse: {metrics['mse']:.3f}, mae: {metrics['mae']:.3f})")
+        # print(f"Built new client_tree (mse: {metrics['mse']:.3f}, mae: {metrics['mae']:.3f})")
         
         if utils.ask_yes_no("Created new client dataset and tree update. Save?"):
             state_dir = Path("out/iter")
@@ -82,7 +74,7 @@ def init_client(args):
             utils.save_client_state(state_dir=state_dir, client_train=client_train, client_tree=client_tree)
             print("Saved tree and dataset at " + state_dir.absolute().as_posix())    
 
-    return client_train, client_tree
+    return client_train, client_test, client_tree
 
 @dataclass
 class LeafInfo:
@@ -97,24 +89,25 @@ def extract_partitions(tree, initial_bounds):
     Each partitions is represented as a list of (lower, upper) bounds for each feature.
     """
     def recurse(node, bounds):
+        # Base case: if this is a leaf node
+        if not isinstance(node, dict):
+            yield bounds
+            return
+    
         index = node.get('index', None)
         value = node.get('value', None)
 
-        # Base case: if this is a leaf node
-        if iteratively.is_leaf(node):
-            yield bounds
-            return
 
         # If left child exists
         left_bounds = [b if i != index else (b[0], min(b[1], value)) for i, b in enumerate(bounds)]
-        if not iteratively.is_leaf(node['left']):
+        if isinstance(node['left'], dict):
             yield from recurse(node['left'], left_bounds)
         else:
             yield left_bounds
 
         # If right child exists
         right_bounds = [b if i != index else (max(b[0], value), b[1]) for i, b in enumerate(bounds)]
-        if not iteratively.is_leaf(node['right']):
+        if isinstance(node['right'], dict):
             yield from recurse(node['right'], right_bounds)
         else:
             yield right_bounds
@@ -182,13 +175,14 @@ def partition_center(partition):
 def find_affected_leaf(client_tree, dummy_train):
     # find all partitions
     initial_bounds = np.array([(-np.inf, np.inf)]*8)
-    partitions = np.array(extract_partitions(client_tree, initial_bounds))
+    partitions = np.array(extract_partitions(client_tree.root, initial_bounds))
+   
     for partition in partitions:
         # get training samples within partition
         leaf_samples_mask = intersect_with_partition(dummy_train[:, :-1], partition)
         # compare actual leaf node and mean of leaf_samples
         inferred_leaf_value = np.mean(dummy_train[leaf_samples_mask][:, -1]) if np.sum(leaf_samples_mask)>0 else 0.0
-        actual_leaf_value = iteratively.predict(client_tree, partition_center(partition))
+        actual_leaf_value = client_tree.predict(partition_center(partition))
         
         # if it doesn't match the actual leaf node, we found the correct leaf
         if inferred_leaf_value != actual_leaf_value:
@@ -201,7 +195,7 @@ def find_affected_leaf(client_tree, dummy_train):
             )
 
 def derive_target_label(leaf_info):
-    return leaf_info.size*leaf_info.actual - (leaf_info.size-1)*leaf_info.inferred
+    return round(leaf_info.size*leaf_info.actual - (leaf_info.size-1)*leaf_info.inferred)
 
 def derive_target_features(leaf_info, previous_bounds):
     # combine previously known bounds with new found ones
@@ -227,85 +221,121 @@ def format_bounds(bounds_array):
 
     return formatted
 
-def init_dummy(client_train):
-    # remove labels
-    features = client_train[:, :-1]
-    
-    # find bounds of each feature (to improve init dummy sample. Helpful? Reasonable assumption?)
-    feature_min = features.min(axis=0)
-    feature_max = features.max(axis=0)
-    
-    # generate random sample within retrieved feature bounds
-    random_features = np.random.uniform(low=feature_min, high=feature_max)
-    random_label = np.random.choice([4, 18])
-    # print("WARNING: replacing random label with target label!")
-    random_data_point = np.append(random_features, random_label)
-    
-    return np.array(random_data_point)
-
 def reconstruct_sample(args):
     utils.AUTOREPLY = args.autoreply
-    ts = perf_counter()
+    # import random
+    # random.seed(3)
+    # np.random.seed(4)
+
     
     # create client training data and first update
-    client_train, client_tree = init_client(args)
+    client_train, client_test, client_tree = init_client(args)
+    
     
     # copy known part train part and init bounds with infinity
-    known_client_train = jnp.delete(client_train, args.target_index, axis=0)
-    feature_bounds = utils.get_feature_bounds(client_train)
+    dummy_train = np.delete(client_train, args.target_index, axis=0)
+    derived_features = np.array([(-np.inf, np.inf)]*8)
+    derived_features[0] = [0, 2+1e-8]
+    derived_label = None
+    # feature_bounds = utils.get_feature_bounds(client_train, extend_int_bounds=False)
     
-    dummy_sample = jnp.array([0.8719898,   0.42725933,  0.46768081,  0.14135563,  0.9600838,   0.40061867,  0.15064119,  0.34395811, 18.])#init_dummy(known_client_train)
-    # utils.visualize_tree(tree1=tree, tree2=client_tree, view=True, labels=("recursive", "iterative"), fp_out=Path("debuganalysis"))
-   
-    def diff_wrapper(_dummy_sample):#, _attack_snapshot_dir=None):
-        # train the dummy tree using known part of client data and '_dummy_sample'
-        dummy_train = jnp.vstack((_dummy_sample, known_client_train))
-        dummy_tree = iteratively.train_tree(
-            dummy_train,
-            max_depth=args.max_depth,
-            min_size=args.min_size
-        )
-        # utils.save_dummy_state(state_dir=_attack_snapshot_dir, dummy_tree=dummy_tree, ignore_conflicts=True)
-        
-        # compute the diff between the tree sent by the client and the dummy tree we just trained
-        # this will be used to adapt the dummy data so that the new dummy_tree will resemble the client
-        # tree more closely.
-        d = compute_tree_difference(client_tree, dummy_tree, client_train[:, -1], dummy_train[:, -1], feature_bounds)
-        print("tree diff =", d.primal)
-        return d
     
-    # Initialize Adam optimizer
-    optimizer = optax.adam(args.learning_rate)
-    opt_state = optimizer.init(dummy_sample)
-
-    jnp.set_printoptions(linewidth=np.inf)
-    np.set_printoptions(linewidth=np.inf)
-    dummy_iterations = []
-
-    # attack_state_dir = Path("out/") / client_tree.fingerprint / f"target-{args.target_index}"
-    for i in range(10):
-        # tree_snapshot_dir = attack_state_dir / str(i) # based on previous dummy_sample
-        # sample_snapshot_dir = attack_state_dir / str(i+1) # +1, since random is "/0/"
+    tree_depths = []
+    for epoch in range(args.epochs):
+        # 0. create new client tree update (yes, this wastes the first tree fit from init_client..)
+        client_tree = regression.RegressionTree(args.max_depth, args.min_size)
+        client_tree.fit(client_train)
+        # print("client tree depth:", client_tree.final_depth)
         
-        # TODO: split sample and label gradient calculation?
-        # Compute the gradient of diff between both trees w.r.t. input (dummy_sample)
+        # include trees were leaf cannot be found, as this might be a result of depth and should be included in the count
+        tree_depths.append(client_tree.final_depth)
         
-        # print("Do stop_gradient after each iteration? I think its not needed, as outside of grad nothing is being traced.. right?")
-        # dummy_sample = jax.lax.stop_gradient(dummy_sample)
-        grad_diff = jax.grad(diff_wrapper)(dummy_sample)#, tree_snapshot_dir)
-        if not grad_diff.any():
-            print("Attack completed!")
-            break
+        # 1. Identify the leaf the target sample ended up during training
+        leaf_info = find_affected_leaf(client_tree, dummy_train)
+        if not leaf_info:
+            # print("couldnt find the leaf (target label must be equal to leaf value)")
+            continue
+        
+        # 2. Derive label of target sample (only need to be done once)
+        if derived_label == None:
+            derived_label = derive_target_label(leaf_info)
+            assert derived_label == client_train[args.target_index, -1]
 
-        # update dummy_sample using adam optimizer
-        updates, opt_state = optimizer.update(grad_diff, opt_state)
-        updates = optax.apply_updates(dummy_sample, updates)
-        dummy_sample = updates
-        dummy_iterations.append(dummy_sample.copy())
+        # 3. Determine the bounds for each feature of the target sample
+        derived_features = derive_target_features(leaf_info=leaf_info, previous_bounds=derived_features)
+        
+    # utils.visualize_tree(tree1=client_tree, view=False, fp_out=Path("debuganalysis"))
+
+    potential_samples_mask = intersect_with_partition(client_test[:, :-1], derived_features)
+    potential_samples = client_test[potential_samples_mask]
+    # potential_samples = potential_samples[potential_samples[:, -1] == derived_label]
+    reconstructed_sample = partition_center(derived_features).round(3).tolist() + [derived_label]
+    reconstructed_sample[0] = round(reconstructed_sample[0])
     
-    for sample in dummy_iterations:
-        print("target index:", client_train[args.target_index])
-        print("dummy sample:", sample, "\n")
+    np.set_printoptions(linewidth=np.inf, precision=3)
+
+    within_bounds = (client_test[:, :-1] >= derived_features[:, 0]) & (client_test[:, :-1] < derived_features[:, 1])
+    percent_within_bounds = within_bounds.sum(axis=0) / client_test.shape[0] * 100
+    # print(f"""
+    #       Potential samples in dataset: {potential_samples.shape[0]}
+    #       Reconstructed: {reconstructed_sample}
+    #       Value Bounds: {format_bounds(derived_features.round(3))}
+    #       Actual sample: {client_train[args.target_index].tolist()}
+    #       """)
+    
+    for sample in client_test[potential_samples_mask]:
+        for i in range(8):
+            assert sample[i] >= derived_features[i][0]
+            assert sample[i] < derived_features[i][1]
+
+    return {
+        "candidates": potential_samples.shape[0],
+        "avg_depth": sum(tree_depths) / len(tree_depths)
+    } | {
+        f"feature_{i}_percent": perc for i, perc in enumerate(percent_within_bounds)
+    }
+
+
+from tqdm import tqdm
+
+def evaluate_attack(args):
+    # 1. epochs vs. uniqueness
+    args.min_size = 2
+    args.max_depth = 15
+    args.n_train = 500
+    args.n_test = 3617
+    args.rand_state = None
+    args.autoreply = 'n'
+    args.client_state = None
+    args.dummy_state = None
+    
+    
+    all_results = []
+    for number_of_epochs in tqdm(range(1, 200, 8)):
+        for _ in range(args.repeats):
+            args.epochs = number_of_epochs
+            
+            result = reconstruct_sample(args)
+            result["epochs"] = number_of_epochs
+            all_results.append(result)
+    
+    df = pd.DataFrame(all_results)
+
+    metrics = [col for col in df.columns if col != 'epochs']
+    agg_results = df.groupby('epochs')[metrics].agg(['mean', 'std']).reset_index()
+    agg_results.columns = ['_'.join(col).strip('_') for col in agg_results.columns.values]
+
+    return agg_results, args.n_test
+    
+
+def create_figures(args):
+    if "partition" in args.which:
+        visualization.draw_tree_partition(args.show)
+    if "splits" in args.which:
+        visualization.plot_splits(args.show)
+    if "evaluation" in args.which:
+        visualization.plot_evaluation(*evaluate_attack(args), args.show)
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -315,6 +345,8 @@ def parse_arguments():
     
     parser_attack = subparsers.add_parser("attack")
     parser_stats = subparsers.add_parser("stats")
+    parser_figures = subparsers.add_parser("figures")
+
     group_yes_no = parser_attack.add_argument_group("Default [y/n]-prompt reply", "Automatically answer prompts with either 'y' or 'n'")
     ex_group_yes_no = group_yes_no.add_mutually_exclusive_group()
     ex_group_yes_no.add_argument('--no', dest='autoreply', action='store_const', const='n', help="Always decline user prompts")
@@ -322,18 +354,22 @@ def parse_arguments():
     parser_attack.add_argument('--learning-rate', '--lr', type=float, default=0.1, help="Initial learning rate for Adam")
     parser_attack.add_argument('--client-state', '-c', type=Path, default=None, help="Existing client dataset and tree update")
     parser_attack.add_argument('--dummy-state', '-d', type=Path, default=None, help="Existing dummy dataset (resume attack)")
-    parser_attack.add_argument('--n-train', type=int, default=100, help="Size of new new client train set")
-    parser_attack.add_argument('--n-test', type=int, default=10, help="Size of new new client test set")
+    parser_attack.add_argument('--n-train', type=int, default=1000, help="Size of new new client train set")
+    parser_attack.add_argument('--n-test', type=int, default=200, help="Size of new new client test set")
     parser_attack.add_argument('--rand-state', type=int, default=43, help="Randomness for client's train/test split")
-    parser_attack.add_argument('--max-depth', '-u', type=int, default=5, help="Upper bound for tree depth during training")
+    parser_attack.add_argument('--max-depth', '-u', type=int, default=15, help="Upper bound for tree depth during training")
     parser_attack.add_argument('--min-size', '-l', type=int, default=2, help="Lower bound for no. samples after splits")
-    parser_attack.add_argument('--epochs', '-e', type=int, default=10, help="N.o. epochs to simulate the attack for (i.e. n.o. client updates)")
+    parser_attack.add_argument('--epochs', '-e', type=int, default=100, help="N.o. epochs to simulate the attack for (i.e. n.o. client updates)")
     parser_attack.set_defaults(func=reconstruct_sample) # callback function
     
     parser_stats.add_argument('--dummy-state', '-d', type=Path, help="The dummy dataset to show the attack stats for")
     parser_stats.add_argument('--client-state', '-c', type=Path, default=None, help="Existing client dataset and tree update")   
     parser_stats.set_defaults(func=print_attack_stats) # callback function
 
+    parser_figures.add_argument('--which', '-w', choices=['evaluation', 'splits', 'partition'], required=True)
+    parser_figures.add_argument('--repeats', '-r', type=int, default=5)
+    parser_figures.add_argument('--show', '-s', action='store_true')
+    parser_figures.set_defaults(func=create_figures)
     return parser.parse_args()
 
 if __name__ == "__main__":
