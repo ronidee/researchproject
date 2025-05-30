@@ -1,10 +1,6 @@
-from time import perf_counter
-import optax
 import argparse
 import numpy as np
 import pandas as pd
-import jax
-import jax.numpy as jnp
 
 from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
@@ -13,9 +9,6 @@ from sklearn.preprocessing import LabelEncoder
 
 import iteratively
 import utils
-from differentiable import compute_tree_difference
-
-np.random.seed(2)
 
 
 ABALONE_PATH = "dataset/abalone/abalone.data"
@@ -68,9 +61,10 @@ def init_client(args):
             client_train,
             max_depth=args.max_depth,
             min_size=args.min_size,
+            feature_bounds=get_feature_bounds(client_train, extend_int_bounds=False)
         )
         
-        metrics = iteratively.test_tree(client_tree, client_test, client_train[:, -1])
+        metrics = iteratively.test_tree(client_tree, client_test)
     
         print(f"Built new client_tree (mse: {metrics['mse']:.3f}, mae: {metrics['mae']:.3f})")
         
@@ -227,82 +221,51 @@ def format_bounds(bounds_array):
 
     return formatted
 
-def init_dummy(client_train):
-    # remove labels
-    features = client_train[:, :-1]
-    
-    # find bounds of each feature (to improve init dummy sample. Helpful? Reasonable assumption?)
-    feature_min = features.min(axis=0)
-    feature_max = features.max(axis=0)
-    
-    # generate random sample within retrieved feature bounds
-    random_features = np.random.uniform(low=feature_min, high=feature_max)
-    random_label = np.random.choice([4, 18])
-    random_data_point = np.append(random_features, random_label)
-    
-    return np.array(random_data_point)
-
 def reconstruct_sample(args):
     utils.AUTOREPLY = args.autoreply
-    ts = perf_counter()
     
     # create client training data and first update
     client_train, client_tree = init_client(args)
     
-    # copy known part train part and init bounds with infinity
-    known_client_train = jnp.delete(client_train, args.target_index, axis=0)
-    feature_bounds = utils.get_feature_bounds(client_train)
     
-    dummy_sample = jnp.array([0.8719898,   0.42725933,  0.46768081,  0.14135563,  0.9600838,   0.40061867,  0.15064119,  0.34395811, 18.])#init_dummy(known_client_train)
+    # copy known part train part and init bounds with infinity
+    dummy_train = np.delete(client_train, args.target_index, axis=0)
+    derived_features = np.array([(-np.inf, np.inf)]*8)
+    derived_features[0] = [0, 2+1e-8]
+    feature_bounds = get_feature_bounds(client_train, extend_int_bounds=False)
+    
     # utils.visualize_tree(tree1=tree, tree2=client_tree, view=True, labels=("recursive", "iterative"), fp_out=Path("debuganalysis"))
    
-    def diff_wrapper(_dummy_sample):#, _attack_snapshot_dir=None):
-        # train the dummy tree using known part of client data and '_dummy_sample'
-        dummy_train = jnp.vstack((_dummy_sample, known_client_train))
-        dummy_tree = iteratively.train_tree(
-            dummy_train,
-            max_depth=args.max_depth,
-            min_size=args.min_size
-        )
-        # utils.save_dummy_state(state_dir=_attack_snapshot_dir, dummy_tree=dummy_tree, ignore_conflicts=True)
+    for epoch in range(args.epochs):
+        # 0. create new client tree update (yes, this wastes the first tree fit from init_client..)
+        client_tree = iteratively.train_tree(client_train, args.max_depth, args.min_size, feature_bounds=feature_bounds)
         
-        # compute the diff between the tree sent by the client and the dummy tree we just trained
-        # this will be used to adapt the dummy data so that the new dummy_tree will resemble the client
-        # tree more closely.
-        d = compute_tree_difference(client_tree, dummy_tree, client_train[:, -1], dummy_train[:, -1], feature_bounds)
-        print("tree diff =", d.primal)
-        return d
+        if epoch == 7:
+            utils.visualize_tree(tree1=client_tree, view=True, fp_out=Path("debuganalysis"))
+            input("?")
+        # 1. Identify the leaf the target sample ended up during training
+        leaf_info = find_affected_leaf(client_tree, dummy_train)
+        if not leaf_info:
+            print("couldnt find the leaf (target label must be equal to leaf value)")
+            continue
+        
+        # 2. Derive label of target sample (only need to be done once)
+        if epoch == 0:
+            derived_label = derive_target_label(leaf_info)
+
+        # 3. Determine the bounds for each feature of the target sample
+        derived_features = derive_target_features(leaf_info=leaf_info, previous_bounds=derived_features)
+        
+    potential_samples_mask = intersect_with_partition(dataset[:, :-1], derived_features)
+    potential_samples = dataset[potential_samples_mask]
+    reconstructed_sample = partition_center(derived_features).round(3).tolist() + [derived_label.round().item()]
+    reconstructed_sample[0] = round(reconstructed_sample[0])
     
-    # Initialize Adam optimizer
-    optimizer = optax.adam(args.learning_rate)
-    opt_state = optimizer.init(dummy_sample)
-
-    jnp.set_printoptions(linewidth=np.inf)
-    # attack_state_dir = Path("out/") / client_tree.fingerprint / f"target-{args.target_index}"
-    for i in range(500):
-        # tree_snapshot_dir = attack_state_dir / str(i) # based on previous dummy_sample
-        # sample_snapshot_dir = attack_state_dir / str(i+1) # +1, since random is "/0/"
-        
-        # TODO: split sample and label gradient calculation?
-        # Compute the gradient of diff between both trees w.r.t. input (dummy_sample)
-        
-        # print("Do stop_gradient after each iteration? I think its not needed, as outside of grad nothing is being traced.. right?")
-        # dummy_sample = jax.lax.stop_gradient(dummy_sample)
-        grad_diff = jax.grad(diff_wrapper)(dummy_sample)#, tree_snapshot_dir)
-        if not grad_diff.any():
-            print("Attack completed!")
-            break
-        # if i % 5 == 0:
-        #     print("Original sample:\t", client_train[args.target_index])
-        #     print("Reconst. sample:\t", dummy_sample)
-        #     print("Pairwise diff.:\t", client_train[args.target_index] - dummy_sample)
-        print("+1")
-        # print("grad_diff:", grad_diff)
-        # update dummy_sample using adam optimizer
-        updates, opt_state = optimizer.update(grad_diff, opt_state)
-        # print("updates:", updates)
-        dummy_sample = optax.apply_updates(dummy_sample, updates)
-
+    print(f"""
+          Potential samples in dataset: {potential_samples.shape[0]})
+          Reconstructed: {reconstructed_sample})
+          Actual sample: {client_train[args.target_index].tolist()}
+          """)
 
 
 def parse_arguments():
