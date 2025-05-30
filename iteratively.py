@@ -61,11 +61,11 @@ def mse(y_true, y_pred):
 def mae(y_true, y_pred):
     return jnp.mean(jnp.abs(y_true - y_pred))
 
-def test_tree(tree, data, y_train):
-    X, y = data[:, :-1], data[:, -1]
+def test_tree(tree, test_data):
+    X, y = test_data[:, :-1], test_data[:, -1]
 
     # predictions = predict(tree, X)
-    predictions = jnp.array([diffable_predict(tree, sample, y_train) for sample in X])
+    predictions = jnp.array([diffable_predict(tree, sample, tree['y_train']) for sample in X])
     return {
         'mse': mse(y, predictions),
         'mae': mae(y, predictions),
@@ -73,11 +73,11 @@ def test_tree(tree, data, y_train):
     }
 
 
-def predict(root, X, y_train):
+def predict(root, X):
         if X.ndim == 1:
-            return __predict(root, X, y_train)
+            return __predict(root, X, root['y_train'])
         elif X.ndim == 2:
-            return jnp.array([__predict(root, sample, y_train) for sample in X])
+            return jnp.array([__predict(root, sample, root['y_train']) for sample in X])
 
 
 def __predict(node, sample, y_train):
@@ -91,8 +91,7 @@ def to_leaf(node, y_train):
     return diffable_subset_mean(y_train, node['subset_mask'])
 
 
-def make_process_node_fn(train, max_depth, min_size, find_best_split, diffable_subset_mean):
-    identity = lambda x, *_: x
+def make_process_node_fn(train, max_depth, min_size, find_best_split):
     
     # --- all of these are pure JAX functions ---
     def split_node(node):
@@ -104,16 +103,7 @@ def make_process_node_fn(train, max_depth, min_size, find_best_split, diffable_s
             'left':        {'subset_mask': info.left_mask},
             'right':       {'subset_mask': info.right_mask},
         }
-        
-    def undo_split(node):
-        return {
-            'subset_mask': node['subset_mask'],
-            'index':       jnp.int8(-1),
-            'value':       jnp.float32(-1),
-            'left':        node['left'],
-            'right':       node['right']
-        }
-        
+                
     def is_split_allowed(node, depth):
         return (node['subset_mask'].sum() > min_size) & (depth < max_depth)
 
@@ -162,9 +152,7 @@ def train_tree(train, max_depth, min_size):
         updated = set_in(child, tail, new_sub)
         return { **tree, head: updated }
 
-    append_to_list = lambda l, item: l + [item]
-    process_node = make_process_node_fn(train, max_depth, min_size,
-                                    find_best_split, diffable_subset_mean)
+    process_node = make_process_node_fn(train, max_depth, min_size, find_best_split)
 
     root = {'subset_mask': jnp.ones(train.shape[0], dtype=bool)}
     raw_nodes = [ ((), root) ]
@@ -183,7 +171,7 @@ def train_tree(train, max_depth, min_size):
                     'left':        node_out['left'],
                     'right':       node_out['right']
                 }
-                
+
             root = set_in(root, path, node_out)
             
             # 2) update host‐side queue normally
@@ -197,7 +185,7 @@ def train_tree(train, max_depth, min_size):
     # print(json.dumps(root, indent=2, cls=TreeEncoder))
     # print(train[:, -1])
     # exit()
-    return root
+    return root | {'y_train': train[:, -1]}
 
 
 def is_leaf(node):
@@ -209,18 +197,7 @@ def diffable_subset_mean(arr, subset_mask):
     return mean
 
 
-def find_best_split(mask, train):
-    # feature_index = randrange(train.shape[1] - 1)
-    # number = _feature_bounds[feature_index]
-    # split_value = jnp.random.uniform(*number)
-    # left_mask, right_mask = test_split(feature_index, split_value, mask, train)
-    # return SplitInfo(
-    #     index=jnp.int8(feature_index),
-    #     value=jnp.float32(split_value),
-    #     left_mask=left_mask,
-    #     right_mask=right_mask
-    # )
-    
+def find_best_split(mask, train):    
     N, D = train[:, :-1].shape
     
     # Note: we want to try out *every* value for splitting at the current node (n.o. values=N*D)
