@@ -22,6 +22,7 @@ ABALONE_PATH = "dataset/abalone/abalone.data"
 
 # Load specified dataset file
 def load_dataset(dataset):
+    # TODO: normalize features
     if dataset == "abalone":
         encoder = LabelEncoder()
         data_abalone = pd.read_csv(ABALONE_PATH, header=None).values

@@ -4,45 +4,44 @@ import jax
 import iteratively
 
 def compute_tree_difference(client_tree, dummy_tree, client_y, dummy_y, initial_bounds):
-    print("WARNING: NOT USING PARTITION SIZE AS WEIGHT YET")
-    partitions, mask = get_intersected_partitions(client_tree, dummy_tree, initial_bounds)
-    # partitions = jnp.unique(partitions, axis=0)
-    partition_centers = jnp.array([partition_center(partition) for partition in partitions])
+    # feature ranges not normalized yet. TODO: normalize features
+    refined_partition, mask = create_intersected_partition(client_tree, dummy_tree, initial_bounds)
+    cell_centers = jnp.array([cell_center(cell) for cell in refined_partition])
+    cell_sizes = jnp.array([cell_size(cell) for cell in refined_partition])
     
     client_predict_fn = lambda x: diffable_predict(client_tree, x, client_y)
     dummy_predict_fn = lambda x: diffable_predict(dummy_tree, x, dummy_y)
     
     fn_squared_errors = jax.vmap(lambda x: (client_predict_fn(x) - dummy_predict_fn(x))**2)
-    squared_errors = fn_squared_errors(partition_centers)
-    mse = jnp.sum(jnp.where(mask, squared_errors, 0.0)) / jnp.sum(mask)
+    squared_errors = fn_squared_errors(cell_centers)
+    mse = jnp.sum(jnp.where(mask, squared_errors, 0.0)) * cell_sizes / jnp.sum(mask)
     return mse
 
-def get_intersected_partitions(client_tree, dummy_tree, initial_bounds):
-    client_partitions = jnp.array(extract_partitions(client_tree, initial_bounds))
-    dummy_partitions = jnp.array(extract_partitions(dummy_tree, initial_bounds))
+def cell_size(cell):
+    return jnp.prod(jnp.abs(cell[:, 0] - cell[:, 1]))
+    
+def create_intersected_partition(client_tree, dummy_tree, initial_bounds):
+    client_cells = jnp.array(extract_partition(client_tree, initial_bounds))
+    dummy_cells = jnp.array(extract_partition(dummy_tree, initial_bounds))
 
-    client_partitions = jnp.unique(client_partitions, axis=0)
-    dummy_partitions = jnp.unique(dummy_partitions, axis=0)
-
-    # Compute the cartesian product indices
-    num_cp = client_partitions.shape[0]
-    num_dp = dummy_partitions.shape[0]
+    client_cells = jnp.unique(client_cells, axis=0)
+    dummy_cells = jnp.unique(dummy_cells, axis=0)
     
     # Create all index pairs (i,j)
-    cp_idx, dp_idx = jnp.meshgrid(jnp.arange(num_cp), jnp.arange(num_dp), indexing='ij')
-    cp_idx = cp_idx.flatten()
-    dp_idx = dp_idx.flatten()
+    client_cells_idx, dummy_cells_idx = jnp.meshgrid(jnp.arange(client_cells.shape[0]), jnp.arange(dummy_cells.shape[0]), indexing='ij')
+    client_cells_idx = client_cells_idx.flatten()
+    dummy_cells_idx = dummy_cells_idx.flatten()
 
     # Extract all pairs
-    cp_flat = client_partitions[cp_idx]
-    dp_flat = dummy_partitions[dp_idx]
+    client_cells_flat = client_cells[client_cells_idx]
+    dummy_cells_flat = dummy_cells[dummy_cells_idx]
 
     # Vectorize the intersection function over these pairs
-    intersections, mask = jax.vmap(intersect_partitions)(cp_flat, dp_flat)
+    intersections, mask = jax.vmap(intersect_cells)(client_cells_flat, dummy_cells_flat)
 
     return intersections, mask
 
-def extract_partitions(tree, initial_bounds):
+def extract_partition(tree, initial_bounds):
     """
     Recursively extract all decision cells from a RegressionTree.
     Each partitions is represented as a list of (lower, upper) bounds for each feature.
@@ -72,17 +71,17 @@ def extract_partitions(tree, initial_bounds):
     
     return list(recurse(tree, initial_bounds))
 
-def intersect_partitions(r1, r2):
-    """Compute intersection of two axis-aligned hyperrectangles."""
-    lower = jnp.maximum(r1[:, 0], r2[:, 0])
-    upper = jnp.minimum(r1[:, 1], r2[:, 1])
+def intersect_cells(c1, c2):
+    # Compute intersection of two axis-aligned hyperrectangles (here: cells of a partition)
+    lower = jnp.maximum(c1[:, 0], c2[:, 0])
+    upper = jnp.minimum(c1[:, 1], c2[:, 1])
     
     is_not_empty = jnp.all(lower < upper)
     intersection = jnp.stack([lower, upper], axis=-1)
     
     return intersection, is_not_empty
 
-def partition_center(partition):
+def cell_center(partition):
     assert 2 <= partition.ndim <= 3 # only allow single cell or array of cells
 
     # replace (-inf, +inf) rows with (-1, -1) for safe mean computation
@@ -94,24 +93,19 @@ def partition_center(partition):
     return jnp.mean(safe_partition, axis=partition.ndim-1)
 
 def diffable_predict(node, sample, y_train, steepness=100.0):
-    """
-    Recursively computes a soft prediction.
-    Instead of a hard branch, we use the sigmoid to softly weight left/right predictions.
-    """
-    # Base case: if the node is a terminal, return its value.
+    # recursively computes a soft prediction.
+    # if the node is a terminal, return its value.
     if iteratively.is_leaf(node):
         return iteratively.to_leaf(node, y_train)
     
-    # Get the split parameters.
     index = node['index']
     threshold = node['value']
     
-    # Compute soft decision weight for left branch (close to 1 if sample[index] < threshold)
+    # compute soft decision weight for left/right branch
     left_weight = soft_step(sample[index], threshold, steepness)
-    # The right branch gets the complementary weight.
     right_weight = 1.0 - left_weight
     
-    # Recursively compute the predictions for left and right branches.
+    # compute predictions for both branches
     left_pred = diffable_predict(node['left'], sample, y_train, steepness)
     right_pred = diffable_predict(node['right'], sample, y_train, steepness)
     
@@ -119,5 +113,4 @@ def diffable_predict(node, sample, y_train, steepness=100.0):
     return left_weight * left_pred + right_weight * right_pred
 
 def soft_step(x, threshold, steepness=100.0):
-    # Approximates the indicator function x < threshold using a sigmoid.
     return jax.nn.sigmoid(steepness * (threshold - x))
